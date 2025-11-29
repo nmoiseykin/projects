@@ -1,0 +1,42 @@
+version: '3.8'
+
+# Use this when you have existing PostgreSQL running locally
+# Start with: docker-compose -f docker-compose.localdb.yml up
+
+services:
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    network_mode: "host"  # Use host network to access localhost PostgreSQL
+    # Note: ports mapping not needed with host network mode
+    environment:
+      DB_HOST: localhost  # Use localhost since we're on host network
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-aurora_db}
+      DB_USER: ${DB_USER:-aurora_user}
+      DB_PASSWORD: ${DB_PASSWORD:-aurora_pass123}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      APP_ENV: ${APP_ENV:-dev}
+      API_KEY: ${API_KEY:-dev-key-change-in-production}
+    volumes:
+      - ./backend:/app
+      - ./logs:/app/logs
+
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000/api
+      NEXT_PUBLIC_API_KEY: ${API_KEY:-dev-key-change-in-production}
+    depends_on:
+      - api
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+
+

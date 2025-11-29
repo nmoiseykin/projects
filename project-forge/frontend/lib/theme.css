@@ -1,0 +1,71 @@
+/* Mr. Robot Theme */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-dark-bg text-neutral-200 font-mono;
+    background-image: 
+      linear-gradient(rgba(50, 255, 121, 0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(50, 255, 121, 0.03) 1px, transparent 1px);
+    background-size: 20px 20px;
+  }
+}
+
+@layer components {
+  .card-matrix {
+    @apply rounded-2xl shadow-matrix border border-zinc-800 bg-dark-card;
+  }
+  
+  .terminal-panel {
+    @apply bg-black border border-matrix-green/30 rounded-lg p-4 font-mono text-sm;
+    background: linear-gradient(
+      to bottom,
+      rgba(0, 0, 0, 0.9),
+      rgba(10, 10, 10, 0.95)
+    );
+    box-shadow: 
+      inset 0 0 20px rgba(50, 255, 121, 0.1),
+      0 0 40px rgba(50, 255, 121, 0.05);
+  }
+  
+  .scanline {
+    position: relative;
+    overflow: hidden;
+  }
+  
+  .scanline::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 2px;
+    background: linear-gradient(
+      to right,
+      transparent,
+      rgba(50, 255, 121, 0.5),
+      transparent
+    );
+    animation: scanline 3s linear infinite;
+  }
+  
+  @keyframes scanline {
+    0% { transform: translateY(0); }
+    100% { transform: translateY(100vh); }
+  }
+  
+  .text-matrix {
+    @apply text-matrix-green;
+    text-shadow: 0 0 10px rgba(50, 255, 121, 0.5);
+  }
+  
+  .btn-matrix {
+    @apply px-4 py-2 bg-dark-card border border-matrix-green/50 text-matrix-green rounded-lg;
+    @apply hover:bg-matrix-green/10 hover:border-matrix-green hover:shadow-matrix-glow;
+    @apply transition-all duration-200;
+  }
+}
+
+

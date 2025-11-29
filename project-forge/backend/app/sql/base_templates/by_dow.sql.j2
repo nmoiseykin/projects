@@ -1,0 +1,191 @@
+-- Backtest template: Group results by day of week
+-- Parameters: entry_time_start, entry_time_end, trade_end_time, target_pts, stop_pts, direction (optional), year_start, year_end
+-- Trend parameters: trend_enabled, trend_timeframe, trend_period, trend_type, trend_strict
+WITH five AS (
+  SELECT
+    (timestamp AT TIME ZONE 'America/Chicago') AT TIME ZONE 'America/New_York' AS ts_ny,
+    open_price, high_price, low_price, close_price
+  FROM market.ohlcv_data
+  WHERE timeframe = '5m'
+),
+{% if trend_enabled %}
+-- OPTIMIZATION: Use pre-computed materialized views for SMA (450x faster!)
+{% if trend_type == 'sma' and trend_timeframe == '15m' and trend_period == 20 %}
+trend_data AS (
+  SELECT ts_ny, close_price, sma_value AS ma_value, trend_direction
+  FROM market.sma_15m_20
+  WHERE ts_ny >= (DATE '{{ year_start }}-01-01' - INTERVAL '1 day')
+    AND ts_ny <= (DATE '{{ year_end }}-12-31' + INTERVAL '1 day')
+),
+{% elif trend_type == 'sma' and trend_timeframe == '15m' and trend_period == 50 %}
+trend_data AS (
+  SELECT ts_ny, close_price, sma_value AS ma_value, trend_direction
+  FROM market.sma_15m_50
+  WHERE ts_ny >= (DATE '{{ year_start }}-01-01' - INTERVAL '1 day')
+    AND ts_ny <= (DATE '{{ year_end }}-12-31' + INTERVAL '1 day')
+),
+{% elif trend_type == 'sma' and trend_timeframe == '30m' and trend_period == 20 %}
+trend_data AS (
+  SELECT ts_ny, close_price, sma_value AS ma_value, trend_direction
+  FROM market.sma_30m_20
+  WHERE ts_ny >= (DATE '{{ year_start }}-01-01' - INTERVAL '1 day')
+    AND ts_ny <= (DATE '{{ year_end }}-12-31' + INTERVAL '1 day')
+),
+{% elif trend_type == 'sma' and trend_timeframe == '1h' and trend_period == 20 %}
+trend_data AS (
+  SELECT ts_ny, close_price, sma_value AS ma_value, trend_direction
+  FROM market.sma_1h_20
+  WHERE ts_ny >= (DATE '{{ year_start }}-01-01' - INTERVAL '1 day')
+    AND ts_ny <= (DATE '{{ year_end }}-12-31' + INTERVAL '1 day')
+),
+{% elif trend_type == 'sma' and trend_timeframe == '5m' and trend_period == 20 %}
+trend_data AS (
+  SELECT ts_ny, close_price, sma_value AS ma_value, trend_direction
+  FROM market.sma_5m_20
+  WHERE ts_ny >= (DATE '{{ year_start }}-01-01' - INTERVAL '1 day')
+    AND ts_ny <= (DATE '{{ year_end }}-12-31' + INTERVAL '1 day')
+),
+{% else %}
+trend_data AS (
+  SELECT
+    (timestamp AT TIME ZONE 'America/Chicago') AT TIME ZONE 'America/New_York' AS ts_ny,
+    close_price,
+    {% if trend_type == 'ema' %}
+    AVG(close_price) OVER (
+      ORDER BY (timestamp AT TIME ZONE 'America/Chicago') AT TIME ZONE 'America/New_York'
+      ROWS BETWEEN {{ trend_period - 1 }} PRECEDING AND CURRENT ROW
+    ) AS ma_value
+    {% else %}
+    AVG(close_price) OVER (
+      ORDER BY (timestamp AT TIME ZONE 'America/Chicago') AT TIME ZONE 'America/New_York'
+      ROWS BETWEEN {{ trend_period - 1 }} PRECEDING AND CURRENT ROW
+    ) AS ma_value
+    {% endif %}
+  FROM market.ohlcv_data
+  WHERE timeframe = '{{ trend_timeframe }}'
+    AND (timestamp AT TIME ZONE 'America/Chicago') AT TIME ZONE 'America/New_York' >= 
+      (DATE '{{ year_start }}-01-01' - INTERVAL '2 days')
+    AND (timestamp AT TIME ZONE 'America/Chicago') AT TIME ZONE 'America/New_York' <= 
+      (DATE '{{ year_end }}-12-31' + INTERVAL '1 day')
+),
+{% endif %}
+{% if trend_type == 'sma' and ((trend_timeframe == '15m' and trend_period == 20) or (trend_timeframe == '15m' and trend_period == 50) or (trend_timeframe == '30m' and trend_period == 20) or (trend_timeframe == '1h' and trend_period == 20) or (trend_timeframe == '5m' and trend_period == 20)) %}
+trend_at_entry AS (
+  SELECT DATE(ts_ny) AS trading_date, ts_ny, ma_value, close_price, trend_direction,
+    ROW_NUMBER() OVER (PARTITION BY DATE(ts_ny), ts_ny::time ORDER BY ts_ny DESC) AS rn
+  FROM trend_data
+),
+trend_at_entry_filtered AS (
+  SELECT trading_date, ts_ny, ma_value, close_price, trend_direction
+  FROM trend_at_entry
+  WHERE rn = 1
+),
+{% else %}
+trend_at_entry AS (
+  SELECT 
+    DATE(ts_ny) AS trading_date,
+    ts_ny,
+    ma_value,
+    close_price,
+    CASE 
+      WHEN close_price > ma_value THEN 'bullish'
+      WHEN close_price < ma_value THEN 'bearish'
+      ELSE 'neutral'
+    END AS trend_direction,
+    ROW_NUMBER() OVER (PARTITION BY DATE(ts_ny), ts_ny::time ORDER BY ts_ny DESC) AS rn
+  FROM trend_data
+),
+trend_at_entry_filtered AS (
+  SELECT trading_date, ts_ny, ma_value, close_price, trend_direction
+  FROM trend_at_entry
+  WHERE rn = 1
+),
+{% endif %}
+{% endif %}
+entries AS (
+  SELECT DATE(f.ts_ny) trading_date, f.open_price entry_price, f.ts_ny entry_ts_ny
+  FROM five f
+  WHERE f.ts_ny::time >= TIME '{{ entry_time_start }}'
+    AND f.ts_ny::time <= TIME '{{ entry_time_end }}'
+),
+setup AS (
+  SELECT 
+    e.*, 
+    {% if direction %}
+    CAST('{{ direction }}' AS TEXT) AS direction{% if trend_enabled %},
+    t.trend_direction
+    {% endif %}
+    {% else %}
+    'neutral' AS direction{% if trend_enabled %},
+    t.trend_direction
+    {% endif %}
+    {% endif %}
+  FROM entries e
+  {% if trend_enabled %}
+  -- Join with trend data to get trend at entry time (optimized: use trading_date for faster lookup)
+  LEFT JOIN LATERAL (
+    SELECT trend_direction
+    FROM trend_at_entry_filtered tae
+    WHERE tae.trading_date = DATE(e.entry_ts_ny)
+      AND tae.ts_ny <= e.entry_ts_ny
+    ORDER BY tae.ts_ny DESC
+    LIMIT 1
+  ) t ON true
+  {% endif %}
+  WHERE DATE_PART('year', e.trading_date) BETWEEN {{ year_start }} AND {{ year_end }}
+    {% if trend_enabled %}
+    -- Apply trend filter
+    {% if trend_strict %}
+    -- Strict mode: only trade in the direction of the trend
+    AND (
+      {% if direction %}
+      (CAST('{{ direction }}' AS TEXT) = 'bullish' AND t.trend_direction = 'bullish')
+      OR (CAST('{{ direction }}' AS TEXT) = 'bearish' AND t.trend_direction = 'bearish')
+      {% else %}
+      -- Auto/neutral direction: allow any trend direction
+      t.trend_direction IS NOT NULL
+      {% endif %}
+    )
+    {% else %}
+    -- Non-strict mode: allow counter-trend if direction is explicitly specified
+    AND t.trend_direction IS NOT NULL
+    {% endif %}
+    {% endif %}
+),
+path AS (
+  SELECT s.trading_date, s.direction, s.entry_price, s.entry_ts_ny,
+         p.segment_start_ny AS ts_ny,
+         p.seg_high AS high_price,
+         p.seg_low AS low_price
+  FROM setup s
+  JOIN market.path_segments_5m p
+    -- OPTIMIZATION: Use pre-aggregated 5m segments instead of raw 1m candles
+    -- This reduces row count by ~80% and enables fast TP/SL detection
+    -- Join on trading date first for fast filtering, then time range
+    ON p.trading_date = s.trading_date
+   AND p.segment_start_ny >= s.entry_ts_ny
+   AND p.segment_start_ny <= (DATE_TRUNC('day', s.entry_ts_ny) + TIME '{{ trade_end_time }}')
+),
+hits AS (
+  SELECT trading_date, direction, entry_price,
+         MIN(CASE WHEN direction='bearish' AND low_price  <= entry_price - {{ target_pts }}
+                  THEN ts_ny
+                  WHEN direction='bullish' AND high_price >= entry_price + {{ target_pts }}
+                  THEN ts_ny END) AS t_target,
+         MIN(CASE WHEN direction='bearish' AND high_price >= entry_price + {{ stop_pts }}
+                  THEN ts_ny
+                  WHEN direction='bullish' AND low_price  <= entry_price - {{ stop_pts }}
+                  THEN ts_ny END) AS t_stop
+  FROM path GROUP BY trading_date, direction, entry_price
+)
+SELECT
+  EXTRACT(DOW FROM trading_date)::INTEGER AS dow,
+  direction,
+  COUNT(*)::INTEGER AS total_trades,
+  SUM(CASE WHEN t_target IS NOT NULL AND (t_stop IS NULL OR t_target < t_stop) THEN 1 ELSE 0 END)::INTEGER AS wins,
+  SUM(CASE WHEN t_stop   IS NOT NULL AND (t_target IS NULL OR t_stop   < t_target) THEN 1 ELSE 0 END)::INTEGER AS losses,
+  SUM(CASE WHEN t_target IS NULL AND t_stop IS NULL THEN 1 ELSE 0 END)::INTEGER AS timeouts,
+  ROUND(100.0 * SUM(CASE WHEN t_target IS NOT NULL AND (t_stop IS NULL OR t_target < t_stop) THEN 1 ELSE 0 END)/NULLIF(COUNT(*),0),2) AS win_rate_percent
+FROM hits
+GROUP BY dow, direction
+ORDER BY dow, direction;

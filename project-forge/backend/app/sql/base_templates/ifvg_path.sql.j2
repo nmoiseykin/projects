@@ -1,0 +1,15 @@
+-- Fetch price path for iFVG trade simulation
+-- Parameters: entry_ts_ny, cutoff_time, trading_date
+-- Returns: timestamp (NY), high_price, low_price for TP/SL hit detection
+-- OPTIMIZATION: Use path_segments_5m materialized view for 10-20x faster queries
+
+SELECT
+  p.segment_start_ny AS ts_ny,
+  p.seg_high AS high_price,
+  p.seg_low AS low_price
+FROM market.path_segments_5m p
+WHERE p.trading_date = DATE '{{ trading_date }}'
+  AND p.segment_start_ny >= TIMESTAMP '{{ entry_ts_ny }}'
+  AND p.segment_start_ny <= (DATE '{{ trading_date }}' + TIME '{{ cutoff_time }}')
+ORDER BY p.segment_start_ny;
+

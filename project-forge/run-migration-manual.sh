@@ -1,0 +1,31 @@
+#!/bin/bash
+# Run this script to execute the database migration
+# You need to run this as postgres superuser or a user with ALTER TABLE privileges
+
+echo "=========================================="
+echo "Database Migration: Add strategy_type column"
+echo "=========================================="
+echo ""
+echo "This script will:"
+echo "  1. Add strategy_type column to backtest_runs, backtest_scenarios, backtest_results"
+echo "  2. Create indexes for performance"
+echo "  3. Update existing rows to 'standard'"
+echo ""
+echo "You need to run this as postgres superuser."
+echo ""
+echo "Options:"
+echo "  A) If you have direct psql access as postgres:"
+echo "     psql -U postgres -d aurora_db -f backend/migrations/add_strategy_type.sql"
+echo ""
+echo "  B) If using Docker and database is in a container:"
+echo "     docker-compose exec db psql -U postgres -d aurora_db -f /tmp/add_strategy_type.sql"
+echo "     (copy file first: docker cp backend/migrations/add_strategy_type.sql project-forge_db_1:/tmp/)"
+echo ""
+echo "  C) If you know the postgres password:"
+echo "     PGPASSWORD=your_postgres_password psql -h localhost -U postgres -d aurora_db -f backend/migrations/add_strategy_type.sql"
+echo ""
+echo "=========================================="
+echo "Migration SQL file location:"
+echo "  backend/migrations/add_strategy_type.sql"
+echo "=========================================="
+

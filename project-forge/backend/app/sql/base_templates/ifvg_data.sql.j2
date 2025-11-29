@@ -1,0 +1,32 @@
+-- Fetch candle data for iFVG strategy
+-- Parameters: fvg_timeframe, entry_timeframe, year_start/year_end OR date_start/date_end, liquidity_timeframe (optional)
+-- Returns: timestamp (NY), timeframe, open_price, high_price, low_price, close_price
+
+WITH timeframes AS (
+  SELECT '{{ fvg_timeframe }}' AS tf
+  UNION ALL
+  SELECT '{{ entry_timeframe }}' AS tf
+  {% if liquidity_timeframe %}
+  UNION ALL
+  SELECT '{{ liquidity_timeframe }}' AS tf
+  {% endif %}
+)
+SELECT
+  (timestamp AT TIME ZONE 'America/Chicago') AT TIME ZONE 'America/New_York' AS ts_ny,
+  timeframe,
+  open_price,
+  high_price,
+  low_price,
+  close_price
+FROM market.ohlcv_data
+WHERE timeframe IN (SELECT tf FROM timeframes)
+  {% if date_start and date_end %}
+  -- Use specific date range if provided
+  AND (timestamp AT TIME ZONE 'America/Chicago') AT TIME ZONE 'America/New_York' >= DATE '{{ date_start }}'
+  AND (timestamp AT TIME ZONE 'America/Chicago') AT TIME ZONE 'America/New_York' <= (DATE '{{ date_end }}' + INTERVAL '1 day' - INTERVAL '1 second')
+  {% elif year_start and year_end %}
+  -- Use year range if date range not provided
+  AND DATE_PART('year', (timestamp AT TIME ZONE 'America/Chicago') AT TIME ZONE 'America/New_York') BETWEEN {{ year_start }} AND {{ year_end }}
+  {% endif %}
+ORDER BY timeframe, ts_ny;
+
