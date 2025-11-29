@@ -1,0 +1,513 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0)
+// Based on LuxAlgo IFVG Indicator - Optimized Backtesting Strategy
+// https://www.tradingview.com/v/8FHucjY6/
+// Enhanced with Risk Management & Optimization Recommendations
+
+//@version=5
+strategy("IFVG Optimized Strategy", shorttitle="IFVG-OPT", overlay=true,
+     initial_capital=100000, 
+     default_qty_type=strategy.fixed, 
+     default_qty_value=1,
+     pyramiding=3,
+     process_orders_on_close=false,
+     calc_on_every_tick=false,
+     close_entries_rule="ANY")
+
+//=============================================================================
+// CORE IFVG INPUTS
+//=============================================================================
+signal_pref = input.string("Close", "Signal Preference", options=["Close", "Wick"])
+atr_multi = input.float(0.25, "ATR Multiplier", step=0.25, minval=0)
+sl_points = input.float(40.0, "Stop Loss (points)", minval=1)
+tp_points = input.float(80.0, "Take Profit (points)", minval=1)
+
+//=============================================================================
+// TIME FILTER (09:00-11:30 ET - Your Edge)
+//=============================================================================
+time_filter_mode = input.string("Custom Time", "Time Filter Mode", options=["Disabled", "Custom Time"], group="Time Filter")
+start_hour = input.int(9, "Start Hour (NY)", minval=0, maxval=23, group="Time Filter")
+start_min = input.int(0, "Start Minute", minval=0, maxval=59, group="Time Filter")
+end_hour = input.int(11, "End Hour (NY)", minval=0, maxval=23, group="Time Filter")
+end_min = input.int(30, "End Minute", minval=0, maxval=59, group="Time Filter")
+time_exit_hour = input.int(11, "Force Close Hour", minval=0, maxval=23, group="Time Filter", tooltip="Close all positions at this hour")
+time_exit_min = input.int(30, "Force Close Minute", minval=0, maxval=59, group="Time Filter")
+
+//=============================================================================
+// DAYS OF WEEK (Thu/Fri/Tue = ON, Mon = OFF)
+//=============================================================================
+trade_monday = input.string("Disabled", "Monday", options=["Disabled", "Long Only", "Short Only", "Both"], group="Days of Week", tooltip="Recommendation: Disabled (weakest day)")
+trade_tuesday = input.string("Short Only", "Tuesday", options=["Disabled", "Long Only", "Short Only", "Both"], group="Days of Week")
+trade_wednesday = input.string("Disabled", "Wednesday", options=["Disabled", "Long Only", "Short Only", "Both"], group="Days of Week")
+trade_thursday = input.string("Short Only", "Thursday", options=["Disabled", "Long Only", "Short Only", "Both"], group="Days of Week", tooltip="Best day: +1.12R/trade")
+trade_friday = input.string("Short Only", "Friday", options=["Disabled", "Long Only", "Short Only", "Both"], group="Days of Week")
+trade_saturday = input.string("Disabled", "Saturday", options=["Disabled", "Long Only", "Short Only", "Both"], group="Days of Week")
+trade_sunday = input.string("Disabled", "Sunday", options=["Disabled", "Long Only", "Short Only", "Both"], group="Days of Week")
+
+//=============================================================================
+// DIRECTION BIAS (Shorts Favored)
+//=============================================================================
+direction_bias = input.string("Shorts Favored", "Direction Bias", options=["Both", "Longs Favored", "Shorts Favored"], group="Entry Filters", tooltip="Shorts: +0.70R/trade vs Longs: +0.38R/trade")
+
+//=============================================================================
+// RISK/REWARD VALIDATION
+//=============================================================================
+min_rr_ratio = input.float(2.0, "Minimum R:R Ratio", minval=1.0, maxval=5.0, step=0.1, group="Entry Filters", tooltip="Skip trades if projected R:R < this value")
+use_structure_sl = input.bool(false, "Use Structure-Based SL", group="Entry Filters", tooltip="Set SL at structure high/low + ATR buffer")
+structure_atr_buffer = input.float(0.2, "Structure SL ATR Buffer", minval=0.1, maxval=1.0, step=0.1, group="Entry Filters")
+
+//=============================================================================
+// DAILY RISK MANAGEMENT
+//=============================================================================
+enable_daily_risk = input.bool(true, "Enable Daily Risk Management", group="Risk Management")
+daily_loss_cap_r = input.float(2.0, "Daily Loss Cap (R)", minval=0.5, maxval=10.0, step=0.5, group="Risk Management")
+max_consecutive_losses = input.int(3, "Max Consecutive Losses", minval=1, maxval=10, group="Risk Management")
+max_consecutive_wins = input.int(3, "Pause After N Wins", minval=1, maxval=10, group="Risk Management")
+max_trades_per_day = input.int(5, "Max Trades Per Day", minval=1, maxval=20, group="Risk Management")
+
+//=============================================================================
+// POSITION SIZING
+//=============================================================================
+use_variable_sizing = input.bool(false, "Use Variable Position Sizing", group="Risk Management", tooltip="1.0R for A+, 0.5R for B- setups")
+base_risk_r = input.float(1.0, "Base Risk (R)", minval=0.1, maxval=5.0, step=0.1, group="Risk Management")
+reduced_risk_r = input.float(0.5, "Reduced Risk (R)", minval=0.1, maxval=2.0, step=0.1, group="Risk Management", tooltip="Use after oversized losses or drawdown")
+
+//=============================================================================
+// PARTIAL PROFIT TAKING
+//=============================================================================
+enable_partial_tp = input.bool(true, "Enable Partial Take Profit", group="Profit Management")
+partial_tp_r = input.float(2.0, "Partial TP at (R)", minval=0.5, maxval=5.0, step=0.1, group="Profit Management")
+partial_tp_percent = input.int(50, "Partial TP %", minval=10, maxval=90, step=5, group="Profit Management")
+runner_tp_r = input.float(3.0, "Runner TP at (R)", minval=1.0, maxval=10.0, step=0.1, group="Profit Management")
+
+//=============================================================================
+// TREND FILTERS (Optional, but ON by default per recommendations)
+//=============================================================================
+use_htf_trend = input.bool(true, "Enable HTF Trend Filter", group="Trend Filter - HTF")
+htf_timeframe = input.timeframe("60", "Higher Timeframe", group="Trend Filter - HTF")
+htf_ema_len = input.int(20, "HTF EMA Length", minval=5, maxval=200, group="Trend Filter - HTF")
+use_ema_filter = input.bool(true, "Enable EMA Filter", group="Trend Filter - EMA")
+ema_length = input.int(20, "EMA Length", minval=5, maxval=500, group="Trend Filter - EMA")
+ema_mode = input.string("Strict", "EMA Mode", options=["Strict", "Loose"], group="Trend Filter - EMA")
+
+//=============================================================================
+// CANDLE COLOR FILTER
+//=============================================================================
+use_candle_color_filter = input.bool(false, "Enable Candle Color Filter", group="Entry Filters")
+candle_color_mode = input.string("Current Bar", "Candle Color Check", options=["Current Bar", "Previous Bar"], group="Entry Filters")
+
+//=============================================================================
+// CORE IFVG LOGIC (From your existing strategy)
+//=============================================================================
+wt = signal_pref == "Wick"
+green = color.new(#089981, 80)
+red = color.new(#f23645, 80)
+invis = color.rgb(0,0,0,100)
+
+type lab
+    int x
+    float y
+    int dir
+
+type fvg
+    int left = na
+    float top = na
+    int right = na
+    float bot = na
+    float mid = na
+    int dir = na
+    int state = na
+    array<lab> labs = na
+    int x_val = na
+
+buffer = 100
+c_top = math.max(open, close)
+c_bot = math.min(open, close)
+
+var bull_fvg_ary = array.new<fvg>()
+var bear_fvg_ary = array.new<fvg>()
+var bull_inv_ary = array.new<fvg>()
+var bear_inv_ary = array.new<fvg>()
+
+fvg_manage(_ary, _inv_ary) =>
+    if _ary.size() >= buffer
+        _ary.shift()
+    if _ary.size() > 0
+        for i = _ary.size()-1 to 0
+            value = _ary.get(i)
+            _dir = value.dir
+            if _dir == 1 and (c_bot < value.bot)
+                value.x_val := time
+                _inv_ary.push(_ary.remove(i))
+            if _dir == -1 and (c_top > value.top)
+                value.x_val := time
+                _inv_ary.push(_ary.remove(i))
+
+inv_manage(_ary) =>
+    fire = false
+    fvg result_fvg = na
+    if _ary.size() >= buffer
+        _ary.shift()
+    if _ary.size() > 0
+        for i = _ary.size()-1 to 0
+            value = _ary.get(i)
+            bx_top = value.top
+            bx_bot = value.bot
+            _dir = value.dir
+            st = value.state
+            
+            if (st == 0 and _dir == 1)
+                value.state := 1
+                value.dir := -1
+            if (_dir == -1 and st == 0)
+                value.state := 1
+                value.dir := 1
+            if st >= 1
+                value.right := time
+            
+            if (_dir == -1 and st == 1 and close < bx_bot and (wt ? high : close[1]) >= bx_bot and (wt ? high : close[1]) < bx_top)
+                value.labs.push(lab.new(time, bx_top, -1))
+                fire := true
+                result_fvg := value
+            
+            if (_dir == 1 and st == 1 and close > bx_top and (wt ? low : close[1]) <= bx_top and (wt ? low : close[1]) > bx_bot)
+                value.labs.push(lab.new(time, bx_bot, 1))
+                fire := true
+                result_fvg := value
+            
+            if st >= 1 and ((_dir == -1 and c_top > bx_top) or (_dir == 1 and c_bot < bx_bot))
+                _ary.remove(i)
+    
+    [fire, result_fvg]
+
+atr = nz(ta.atr(200) * atr_multi, ta.cum(high - low) / (bar_index + 1))
+fvg_up = (low > high[2]) and (close[1] > high[2])
+fvg_down = (high < low[2]) and (close[1] < low[2])
+
+if fvg_up and math.abs(low - high[2]) > atr
+    array.push(bull_fvg_ary, fvg.new(time[1], low, time, high[2], math.avg(low, high[2]), 1, 0, array.new<lab>(), na))
+
+if fvg_down and math.abs(low[2] - high) > atr
+    array.push(bear_fvg_ary, fvg.new(time[1], low[2], time, high, math.avg(high, low[2]), -1, 0, array.new<lab>(), na))
+
+fvg_manage(bull_fvg_ary, bull_inv_ary)
+fvg_manage(bear_fvg_ary, bear_inv_ary)
+
+[bear_signal_raw, bear_fvg_data] = inv_manage(bull_inv_ary)
+[bull_signal_raw, bull_fvg_data] = inv_manage(bear_inv_ary)
+
+both_signals = bull_signal_raw and bear_signal_raw
+bull_signal = bull_signal_raw and not bear_signal_raw
+bear_signal = bear_signal_raw and not bull_signal_raw
+
+//=============================================================================
+// TIME & DAY FILTERS
+//=============================================================================
+ny_tz = "America/New_York"
+current_hour_ny = hour(time, ny_tz)
+current_min_ny = minute(time, ny_tz)
+current_time_mins_ny = current_hour_ny * 60 + current_min_ny
+current_dow = dayofweek(time, ny_tz)
+
+current_day_setting = switch current_dow
+    1 => trade_sunday
+    2 => trade_monday
+    3 => trade_tuesday
+    4 => trade_wednesday
+    5 => trade_thursday
+    6 => trade_friday
+    7 => trade_saturday
+    => "Disabled"
+
+day_allows_long = current_day_setting == "Both" or current_day_setting == "Long Only"
+day_allows_short = current_day_setting == "Both" or current_day_setting == "Short Only"
+day_allowed = current_day_setting != "Disabled"
+
+in_time_window = true
+if time_filter_mode == "Custom Time"
+    start_time_mins = start_hour * 60 + start_min
+    end_time_mins = end_hour * 60 + end_min
+    if start_time_mins <= end_time_mins
+        in_time_window := current_time_mins_ny >= start_time_mins and current_time_mins_ny < end_time_mins
+    else
+        in_time_window := current_time_mins_ny >= start_time_mins or current_time_mins_ny < end_time_mins
+
+in_trading_window_long = in_time_window and day_allows_long
+in_trading_window_short = in_time_window and day_allows_short
+
+// Direction bias
+direction_allows_long = direction_bias == "Both" or direction_bias == "Longs Favored"
+direction_allows_short = direction_bias == "Both" or direction_bias == "Shorts Favored"
+
+//=============================================================================
+// TREND FILTERS
+//=============================================================================
+htf_close = request.security(syminfo.tickerid, htf_timeframe, close, barmerge.gaps_off, barmerge.lookahead_off)
+htf_ema = request.security(syminfo.tickerid, htf_timeframe, ta.ema(close, htf_ema_len), barmerge.gaps_off, barmerge.lookahead_off)
+htf_ema_prev = request.security(syminfo.tickerid, htf_timeframe, ta.ema(close, htf_ema_len)[1], barmerge.gaps_off, barmerge.lookahead_off)
+htf_price_above_ema = htf_close > htf_ema
+htf_ema_rising = htf_ema > htf_ema_prev
+htf_bullish = htf_price_above_ema and htf_ema_rising
+htf_bearish = not htf_price_above_ema and not htf_ema_rising
+htf_allows_long = use_htf_trend ? htf_bullish : true
+htf_allows_short = use_htf_trend ? htf_bearish : true
+
+ema_value = ta.ema(close, ema_length)
+ema_touched_recently = ta.lowest(low, 3) <= ema_value and ta.highest(high, 3) >= ema_value
+ema_allows_long = not use_ema_filter ? true : (ema_mode == "Strict" ? close > ema_value : (close > ema_value or ema_touched_recently))
+ema_allows_short = not use_ema_filter ? true : (ema_mode == "Strict" ? close < ema_value : (close < ema_value or ema_touched_recently))
+
+trend_allows_long = htf_allows_long and ema_allows_long
+trend_allows_short = htf_allows_short and ema_allows_short
+
+// Candle color filter
+check_bar = candle_color_mode == "Current Bar" ? 0 : 1
+check_close = close[check_bar]
+check_open = open[check_bar]
+candle_is_green = check_close > check_open
+candle_is_red = check_close < check_open
+candle_allows_long = not use_candle_color_filter or candle_is_green
+candle_allows_short = not use_candle_color_filter or candle_is_red
+
+//=============================================================================
+// DAILY RISK MANAGEMENT
+//=============================================================================
+var float daily_pnl_r = 0.0
+var int daily_trade_count = 0
+var int consecutive_losses = 0
+var int consecutive_wins = 0
+var int last_trade_day = 0
+var bool trading_paused = false
+var float last_closed_pnl = 0.0
+var float last_closed_pnl_r = 0.0
+
+if dayofweek(time, ny_tz) != last_trade_day
+    daily_pnl_r := 0.0
+    daily_trade_count := 0
+    consecutive_losses := 0
+    consecutive_wins := 0
+    trading_paused := false
+    last_trade_day := dayofweek(time, ny_tz)
+
+if strategy.closedtrades > 0
+    last_trade = strategy.closedtrades - 1
+    last_closed_pnl := strategy.closedtrades.profit(last_trade)
+    last_closed_pnl_r := last_closed_pnl / (sl_points * syminfo.pointvalue)
+    
+    if strategy.closedtrades > strategy.closedtrades[1]
+        daily_pnl_r := daily_pnl_r + last_closed_pnl_r
+        daily_trade_count := daily_trade_count + 1
+        
+        if last_closed_pnl_r < 0
+            consecutive_losses := consecutive_losses + 1
+            consecutive_wins := 0
+        else
+            consecutive_wins := consecutive_wins + 1
+            consecutive_losses := 0
+
+daily_risk_allowed = true
+if enable_daily_risk
+    if daily_pnl_r <= -daily_loss_cap_r
+        daily_risk_allowed := false
+        log.error("🛑 DAILY LOSS CAP HIT | Daily P&L: {0}R | Cap: {1}R", daily_pnl_r, daily_loss_cap_r)
+    
+    if consecutive_losses >= max_consecutive_losses
+        daily_risk_allowed := false
+        log.error("🛑 CONSECUTIVE LOSSES LIMIT | Losses: {0} | Max: {1}", consecutive_losses, max_consecutive_losses)
+    
+    if consecutive_wins >= max_consecutive_wins
+        trading_paused := true
+        log.warning("⏸️ WIN STREAK PAUSE | Wins: {0}", consecutive_wins)
+    
+    if daily_trade_count >= max_trades_per_day
+        daily_risk_allowed := false
+        log.error("🛑 MAX TRADES PER DAY | Trades: {0} | Max: {1}", daily_trade_count, max_trades_per_day)
+
+// Time-based exit
+time_to_exit = current_hour_ny == time_exit_hour and current_min_ny >= time_exit_min
+if time_to_exit and strategy.position_size != 0
+    strategy.close_all()
+    log.warning("⏰ TIME-BASED EXIT | Closing all positions at {0}:{1} ET", time_exit_hour, time_exit_min)
+
+//=============================================================================
+// RISK/REWARD VALIDATION
+//=============================================================================
+calculate_rr(entry_price, sl_price, tp_price) =>
+    risk = math.abs(entry_price - sl_price)
+    reward = math.abs(tp_price - entry_price)
+    risk > 0 ? reward / risk : 0.0
+
+get_structure_sl(is_long) =>
+    swing_len = 5
+    float structure_sl = na
+    if is_long
+        swing_low = ta.pivotlow(low, swing_len, swing_len)
+        structure_sl := not na(swing_low) ? swing_low - (ta.atr(14) * structure_atr_buffer) : na
+    else
+        swing_high = ta.pivothigh(high, swing_len, swing_len)
+        structure_sl := not na(swing_high) ? swing_high + (ta.atr(14) * structure_atr_buffer) : na
+    structure_sl
+
+//=============================================================================
+// POSITION SIZING
+//=============================================================================
+get_position_size(risk_r) =>
+    risk_dollars = risk_r * (sl_points * syminfo.pointvalue)
+    qty = math.round(risk_dollars / (sl_points * syminfo.pointvalue))
+    math.max(1, qty)
+
+//=============================================================================
+// PARTIAL TP TRACKING
+//=============================================================================
+var bool partial_tp_taken_long = false
+var bool partial_tp_taken_short = false
+var float partial_entry_price_long = na
+var float partial_entry_price_short = na
+
+if strategy.position_size == 0
+    partial_tp_taken_long := false
+    partial_tp_taken_short := false
+    partial_entry_price_long := na
+    partial_entry_price_short := na
+
+//=============================================================================
+// ENTRY LOGIC
+//=============================================================================
+no_position = strategy.position_size == 0
+
+// LONG Entry
+if bull_signal and daily_risk_allowed and not trading_paused and no_position and in_trading_window_long and direction_allows_long and trend_allows_long and candle_allows_long
+    entry_price = close
+    sl_price = use_structure_sl ? get_structure_sl(true) : (entry_price - sl_points)
+    tp_price = entry_price + tp_points
+    
+    if na(sl_price)
+        sl_price := entry_price - sl_points
+    
+    projected_rr = calculate_rr(entry_price, sl_price, tp_price)
+    
+    if projected_rr >= min_rr_ratio
+        risk_r = use_variable_sizing and (consecutive_losses > 0 or daily_pnl_r < 0) ? reduced_risk_r : base_risk_r
+        qty = get_position_size(risk_r)
+        
+        strategy.entry("Long", strategy.long, qty=qty)
+        log.info("✅ LONG ENTRY | Entry: {0} | SL: {1} | TP: {2} | R:R: {3} | Risk: {4}R | Qty: {5}", entry_price, sl_price, tp_price, projected_rr, risk_r, qty)
+    else
+        log.warning("❌ LONG SKIPPED | R:R: {0} | Min: {1}", projected_rr, min_rr_ratio)
+
+// SHORT Entry
+if bear_signal and daily_risk_allowed and not trading_paused and no_position and in_trading_window_short and direction_allows_short and trend_allows_short and candle_allows_short
+    entry_price = close
+    sl_price = use_structure_sl ? get_structure_sl(false) : (entry_price + sl_points)
+    tp_price = entry_price - tp_points
+    
+    if na(sl_price)
+        sl_price := entry_price + sl_points
+    
+    projected_rr = calculate_rr(entry_price, sl_price, tp_price)
+    
+    if projected_rr >= min_rr_ratio
+        risk_r = use_variable_sizing and (consecutive_losses > 0 or daily_pnl_r < 0) ? reduced_risk_r : base_risk_r
+        qty = get_position_size(risk_r)
+        
+        strategy.entry("Short", strategy.short, qty=qty)
+        log.info("✅ SHORT ENTRY | Entry: {0} | SL: {1} | TP: {2} | R:R: {3} | Risk: {4}R | Qty: {5}", entry_price, sl_price, tp_price, projected_rr, risk_r, qty)
+    else
+        log.warning("❌ SHORT SKIPPED | R:R: {0} | Min: {1}", projected_rr, min_rr_ratio)
+
+//=============================================================================
+// EXIT MANAGEMENT
+//=============================================================================
+var bool exits_set_long = false
+var bool exits_set_short = false
+
+long_opened = strategy.position_size > 0 and strategy.position_size[1] == 0
+short_opened = strategy.position_size < 0 and strategy.position_size[1] == 0
+
+if strategy.position_size == 0
+    exits_set_long := false
+    exits_set_short := false
+
+// Set initial SL/TP
+if long_opened and not exits_set_long
+    entry = strategy.position_avg_price
+    sl = entry - sl_points
+    tp = entry + tp_points
+    if sl < entry and tp > entry
+        strategy.exit("Long Exit", from_entry="Long", stop=sl, limit=tp, qty_percent=100)
+        exits_set_long := true
+        log.info("🔵 LONG EXIT SET | Entry: {0} | SL: {1} | TP: {2}", entry, sl, tp)
+
+if short_opened and not exits_set_short
+    entry = strategy.position_avg_price
+    sl = entry + sl_points
+    tp = entry - tp_points
+    if sl > entry and tp < entry
+        strategy.exit("Short Exit", from_entry="Short", stop=sl, limit=tp, qty_percent=100)
+        exits_set_short := true
+        log.info("🔴 SHORT EXIT SET | Entry: {0} | SL: {1} | TP: {2}", entry, sl, tp)
+
+// Partial TP Management
+if strategy.position_size > 0 and enable_partial_tp
+    entry = strategy.position_avg_price
+    current_price = close
+    profit_points = current_price - entry
+    profit_r = profit_points / sl_points
+    
+    if profit_r >= partial_tp_r and not partial_tp_taken_long
+        partial_qty = math.round(strategy.position_size * partial_tp_percent / 100)
+        strategy.close("Long", qty=partial_qty, comment="Partial TP")
+        partial_tp_taken_long := true
+        partial_entry_price_long := entry
+        log.info("📊 PARTIAL TP TAKEN (LONG) | Profit: {0}R | Closed: {1}% | Remaining: {2}", profit_r, partial_tp_percent, strategy.position_size - partial_qty)
+        
+        // Runner keeps original SL distance
+        sl_runner = entry - sl_points
+        runner_tp_price = entry + (runner_tp_r * sl_points)
+        strategy.exit("Long Runner", from_entry="Long", stop=sl_runner, limit=runner_tp_price, qty_percent=100)
+
+if strategy.position_size < 0 and enable_partial_tp
+    entry = strategy.position_avg_price
+    current_price = close
+    profit_points = entry - current_price
+    profit_r = profit_points / sl_points
+    
+    if profit_r >= partial_tp_r and not partial_tp_taken_short
+        partial_qty = math.round(math.abs(strategy.position_size) * partial_tp_percent / 100)
+        strategy.close("Short", qty=partial_qty, comment="Partial TP")
+        partial_tp_taken_short := true
+        partial_entry_price_short := entry
+        log.info("📊 PARTIAL TP TAKEN (SHORT) | Profit: {0}R | Closed: {1}% | Remaining: {2}", profit_r, partial_tp_percent, math.abs(strategy.position_size) - partial_qty)
+        
+        // Runner keeps original SL distance
+        sl_runner = entry + sl_points
+        runner_tp_price = entry - (runner_tp_r * sl_points)
+        strategy.exit("Short Runner", from_entry="Short", stop=sl_runner, limit=runner_tp_price, qty_percent=100)
+
+//=============================================================================
+// TRADE EXIT LOGGING
+//=============================================================================
+long_closed = strategy.position_size[1] > 0 and strategy.position_size == 0
+short_closed = strategy.position_size[1] < 0 and strategy.position_size == 0
+
+if long_closed
+    entry_price = strategy.closedtrades.entry_price(strategy.closedtrades - 1)
+    exit_price = strategy.closedtrades.exit_price(strategy.closedtrades - 1)
+    profit = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    profit_r = profit / (sl_points * syminfo.pointvalue)
+    exit_reason = exit_price <= (entry_price - sl_points) ? "STOP LOSS" : exit_price >= (entry_price + tp_points) ? "TAKE PROFIT" : "OTHER"
+    log.info("🔵 LONG CLOSED | Entry: {0} | Exit: {1} | P&L: {2} ({3}R) | Reason: {4}", entry_price, exit_price, profit, profit_r, exit_reason)
+
+if short_closed
+    entry_price = strategy.closedtrades.entry_price(strategy.closedtrades - 1)
+    exit_price = strategy.closedtrades.exit_price(strategy.closedtrades - 1)
+    profit = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    profit_r = profit / (sl_points * syminfo.pointvalue)
+    exit_reason = exit_price >= (entry_price + sl_points) ? "STOP LOSS" : exit_price <= (entry_price - tp_points) ? "TAKE PROFIT" : "OTHER"
+    log.info("🔴 SHORT CLOSED | Entry: {0} | Exit: {1} | P&L: {2} ({3}R) | Reason: {4}", entry_price, exit_price, profit, profit_r, exit_reason)
+
+//=============================================================================
+// VISUAL
+//=============================================================================
+bgcolor(strategy.position_size > 0 ? color.new(color.green, 95) : strategy.position_size < 0 ? color.new(color.red, 95) : na)
+plot(use_htf_trend ? htf_ema : na, "HTF EMA", color=color.new(color.blue, 30), linewidth=2)
+

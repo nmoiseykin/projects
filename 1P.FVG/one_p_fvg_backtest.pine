@@ -1,0 +1,233 @@
+// 1P.FVG Backtest - First Presented Fair Value Gap after 9:30 NY Open (1m)
+// Inspired by: "ICT 9:30am First FVG" open-source indicator on TradingView
+// https://www.tradingview.com/v/K587gQPT/
+// Strategy:
+//  - Detects the FIRST fair value gap of the NY day, starting at/after 9:31 NY
+//  - Shows that 1P FVG on the chart until a user-defined NY time (default 16:00)
+//  - Backtests a simple RR-based trade on retest of that gap
+
+//@version=5
+strategy("1P.FVG Backtest", shorttitle="1P-FVG", overlay=true,
+     initial_capital=100000,
+     default_qty_type=strategy.fixed,
+     default_qty_value=1,
+     pyramiding=0,
+     process_orders_on_close=false,
+     calc_on_every_tick=false,
+     close_entries_rule="ANY")
+
+//=============================================================================
+// INPUTS
+//=============================================================================
+session_tz = "America/New_York"
+
+// NY session window (only search for 1P FVG inside this)
+start_hour_ny = input.int(9, "Session Start Hour (NY)", minval=0, maxval=23)
+start_min_ny  = input.int(30, "Session Start Minute (NY)", minval=0, maxval=59)
+// First FVG is allowed starting at 9:31 (we enforce that in logic)
+
+// How long to keep the 1P FVG printed on the chart (per day)
+end_hour_ny   = input.int(16, "Print Until Hour (NY)", minval=0, maxval=23)
+end_min_ny    = input.int(0, "Print Until Minute (NY)", minval=0, maxval=59)
+
+// Backtest parameters
+rr_multiple    = input.float(2.0, "Target RR Multiple", minval=0.5, maxval=10.0, step=0.5, tooltip="TP distance = RR * (entry - SL)")
+sl_offset_pts  = input.float(0.0, "Stop Offset (pts)", minval=0.0, step=0.25, tooltip="Additional distance placed beyond the gap boundary when positioning stops")
+
+// Simple direction filter
+direction     = input.string("Both", "Direction", options=["Both", "Long Only", "Short Only"])
+
+// Visuals & diagnostics
+show_boxes            = input.bool(true, "Show 1P.FVG Box")
+display_days          = input.int(21, "Days to Display 1P.FVG", minval=1, maxval=30, tooltip="Keep the most recent NY-session boxes visible for this many days")
+show_entry_labels     = input.bool(true, "Draw Entry Labels")
+show_signal_markers   = input.bool(true, "Draw Signal Markers")
+log_trades            = input.bool(true, "Log Executed Trades")
+log_signal_diagnostics = input.bool(false, "Log Signal Diagnostics")
+bull_color            = input.color(color.new(color.green, 80), "Bullish FVG Color")
+bear_color            = input.color(color.new(color.red, 80), "Bearish FVG Color")
+
+// Safety: restrict to <= 15m as in the reference indicator
+time_ok = timeframe.in_seconds(timeframe.period) <= timeframe.in_seconds("15")
+
+//=============================================================================
+// TIME & SESSION HELPERS
+//=============================================================================
+ny_hour  = hour(time,  session_tz)
+ny_min   = minute(time, session_tz)
+ny_day   = dayofmonth(time, session_tz)
+
+sess_start_mins = start_hour_ny * 60 + start_min_ny
+sess_end_mins   = end_hour_ny   * 60 + end_min_ny
+curr_mins_ny    = ny_hour * 60 + ny_min
+
+in_session = curr_mins_ny >= sess_start_mins and curr_mins_ny <= sess_end_mins
+
+// New trading day (NY date)
+var int last_session_day = na
+var int session_counter  = 0
+new_session_day = ny_day != nz(last_session_day)
+if new_session_day
+    last_session_day := ny_day
+    session_counter += 1
+
+//=============================================================================
+// FVG DETECTION (basic 3-candle gap logic on current timeframe)
+//=============================================================================
+// Bullish FVG: gap between low[1] and high[2], price jumps up
+bull_fvg = low > high[2]
+// Bearish FVG: gap between low[2] and high[1], price jumps down
+bear_fvg = high < low[2]
+
+// FVG bounds
+fvg_bull_top = high[2]
+fvg_bull_bot = low
+
+fvg_bear_top = high
+fvg_bear_bot = low[2]
+
+//=============================================================================
+// TRACK 1P FVG PER DAY (FIRST after 9:30 NY, starting 9:31+ only)
+//=============================================================================
+var bool   have_1p_fvg_today = false
+var bool   onep_is_bull      = false
+var float  onep_top          = na
+var float  onep_bot          = na
+var int    onep_day          = na
+var bool   trade_taken_today = false
+var bool   search_closed_today = false
+var array<box>  onep_boxes        = array.new_box()
+var array<int>  onep_box_sessions = array.new_int()
+var array<float> onep_box_tops    = array.new_float()
+var array<float> onep_box_bots    = array.new_float()
+
+// Reset at new NY day
+if new_session_day
+    have_1p_fvg_today := false
+    onep_is_bull      := false
+    onep_top          := na
+    onep_bot          := na
+    onep_day          := ny_day
+    trade_taken_today := false
+    search_closed_today := false
+
+// Only consider FVGs during defined session, starting at 9:31 NY (inclusive)
+after_931 = curr_mins_ny >= (9 * 60 + 31)
+
+can_search_1p = time_ok and in_session and after_931 and not search_closed_today
+
+new_fvg_captured = false
+
+if can_search_1p
+    if bull_fvg
+        have_1p_fvg_today := true
+        onep_is_bull      := true
+        onep_top          := fvg_bull_top
+        onep_bot          := fvg_bull_bot
+        onep_day          := ny_day
+        new_fvg_captured  := true
+        search_closed_today := true
+    else if bear_fvg
+        have_1p_fvg_today := true
+        onep_is_bull      := false
+        onep_top          := fvg_bear_top
+        onep_bot          := fvg_bear_bot
+        onep_day          := ny_day
+        new_fvg_captured  := true
+        search_closed_today := true
+
+if show_boxes and new_fvg_captured
+    fvg_color = onep_is_bull ? bull_color : bear_color
+    new_box = box.new(time, onep_top, time, onep_bot, xloc=xloc.bar_time, border_color=color.new(color.white, 0), border_width=1, bgcolor=fvg_color)
+    array.push(onep_boxes, new_box)
+    array.push(onep_box_sessions, session_counter)
+    array.push(onep_box_tops, onep_top)
+    array.push(onep_box_bots, onep_bot)
+
+//=============================================================================
+// BOX MAINTENANCE (limit number of historical boxes)
+//=============================================================================
+if show_boxes
+    min_session_to_keep = math.max(session_counter - display_days + 1, 1)
+    idx = array.size(onep_boxes) - 1
+    while idx >= 0
+        sess_id = array.get(onep_box_sessions, idx)
+        if sess_id < min_session_to_keep
+            old_box = array.remove(onep_boxes, idx)
+            box.delete(old_box)
+            array.remove(onep_box_sessions, idx)
+            array.remove(onep_box_tops, idx)
+            array.remove(onep_box_bots, idx)
+        idx -= 1
+
+//=============================================================================
+// DRAW / EXTEND 1P FVG BOX UNTIL SELECTED TIME
+//=============================================================================
+// It will keep printing until the configured NY time (end_hour_ny:end_min_ny) for that day.
+in_print_window = curr_mins_ny <= sess_end_mins and ny_day == onep_day
+
+if show_boxes and have_1p_fvg_today and not na(onep_top) and not na(onep_bot) and in_print_window
+    active_idx = array.size(onep_boxes) - 1
+    if active_idx >= 0 and array.get(onep_box_sessions, active_idx) == session_counter
+        active_box = array.get(onep_boxes, active_idx)
+        box.set_right(active_box, time)
+        box.set_top(active_box, onep_top)
+        box.set_bottom(active_box, onep_bot)
+
+//=============================================================================
+// BACKTEST LOGIC: ENTRY ON SPECIFIED RETEST CANDLES
+//=============================================================================
+no_pos         = strategy.position_size == 0
+bullish_candle = close > open
+bearish_candle = close < open
+same_session   = ny_day == onep_day
+
+allow_long  = direction == "Both" or direction == "Long Only"
+allow_short = direction == "Both" or direction == "Short Only"
+
+long_wick_touch    = (low <= onep_top and high >= onep_bot)
+short_wick_touch   = (high >= onep_bot and low <= onep_top)
+long_close_clear  = close > onep_top
+short_close_clear = close < onep_bot
+
+long_signal = allow_long and no_pos and not trade_taken_today and same_session and have_1p_fvg_today and onep_is_bull and bullish_candle and long_wick_touch and long_close_clear
+short_signal = allow_short and no_pos and not trade_taken_today and same_session and have_1p_fvg_today and not onep_is_bull and bearish_candle and short_wick_touch and short_close_clear
+
+if log_signal_diagnostics and have_1p_fvg_today and same_session and not trade_taken_today
+    log.info(str.format("Signal check day={0} bullFVG={1} bullBar={2} wickTouch={3} closeClear={4}", ny_day, onep_is_bull, bullish_candle, long_wick_touch, long_close_clear))
+    log.info(str.format("Signal check day={0} bearFVG={1} bearBar={2} wickTouch={3} closeClear={4}", ny_day, not onep_is_bull, bearish_candle, short_wick_touch, short_close_clear))
+
+plotshape(show_signal_markers and long_signal, title="1P Long Signal", location=location.belowbar, style=shape.triangleup, color=color.new(color.green, 0), text="L", size=size.small)
+plotshape(show_signal_markers and short_signal, title="1P Short Signal", location=location.abovebar, style=shape.triangledown, color=color.new(color.red, 0), text="S", size=size.small)
+
+if long_signal
+    entry_price_long = close
+    risk_pts = math.max(entry_price_long - onep_bot, syminfo.mintick)
+    sl_price = onep_bot
+    tp_price = entry_price_long + risk_pts * rr_multiple
+    strategy.entry("1P Long", strategy.long)
+    strategy.exit("1P Long Exit", from_entry="1P Long", stop=sl_price, limit=tp_price)
+    trade_taken_today := true
+    if show_entry_labels
+        label.new(bar_index, high, str.format("LONG\nE:{0}\nSL:{1}\nTP:{2}", str.tostring(entry_price_long, format.mintick), str.tostring(sl_price, format.mintick), str.tostring(tp_price, format.mintick)), style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white, size=size.small)
+    if log_trades
+        log.info(str.format("1P Long entry={0} SL={1} TP={2} session={3}", str.tostring(entry_price_long, format.mintick), str.tostring(sl_price, format.mintick), str.tostring(tp_price, format.mintick), str.tostring(session_counter)))
+
+if short_signal
+    entry_price_short = close
+    risk_pts = math.max(onep_top - entry_price_short, syminfo.mintick)
+    sl_price = onep_top
+    tp_price = entry_price_short - risk_pts * rr_multiple
+    strategy.entry("1P Short", strategy.short)
+    strategy.exit("1P Short Exit", from_entry="1P Short", stop=sl_price, limit=tp_price)
+    trade_taken_today := true
+    if show_entry_labels
+        label.new(bar_index, low, str.format("SHORT\nE:{0}\nSL:{1}\nTP:{2}", str.tostring(entry_price_short, format.mintick), str.tostring(sl_price, format.mintick), str.tostring(tp_price, format.mintick)), style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white, size=size.small)
+    if log_trades
+        log.info(str.format("1P Short entry={0} SL={1} TP={2} session={3}", str.tostring(entry_price_short, format.mintick), str.tostring(sl_price, format.mintick), str.tostring(tp_price, format.mintick), str.tostring(session_counter)))
+
+//=============================================================================
+// DEBUG / VISUAL
+//=============================================================================
+plot(have_1p_fvg_today ? onep_top : na, title="1P FVG Top", color=color.new(color.white, 0), style=plot.style_linebr)
+plot(have_1p_fvg_today ? onep_bot : na, title="1P FVG Bottom", color=color.new(color.white, 0), style=plot.style_linebr)

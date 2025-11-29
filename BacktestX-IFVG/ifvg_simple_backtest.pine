@@ -1,0 +1,1528 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0)
+// Based on LuxAlgo IFVG Indicator - Simple Backtesting Strategy
+// https://www.tradingview.com/v/8FHucjY6/
+
+//@version=5
+strategy("IFVG Simple Backtest", shorttitle="IFVG-BT", overlay=true,
+     initial_capital=100000, 
+     default_qty_type=strategy.fixed, 
+     default_qty_value=1,
+     pyramiding=3,  // Allow up to 3 units for Model 2
+     process_orders_on_close=false,
+     calc_on_every_tick=false,
+     close_entries_rule="ANY")
+
+//=============================================================================
+// INPUTS
+//=============================================================================
+signal_pref = input.string("Close", "Signal Preference", options=["Close", "Wick"])
+atr_multi = input.float(0.25, "ATR Multiplier", step=0.25, minval=0)
+sl_points = input.float(40.0, "Stop Loss (points)", minval=1)
+tp_points = input.float(80.0, "Take Profit (points)", minval=1)
+trade_dir = input.string("Disabled", "Global Direction", options=["Disabled", "Both", "Long Only", "Short Only"], tooltip="Disabled: Use day-specific filters. Other options: Day-specific filters override this setting.")
+enable_daily_win_limit = input.bool(true, "Enable Win Halt", group="Daily Trade Limits")
+max_wins_per_day = input.int(2, "Max Wins Per Day", minval=1, tooltip="Stop taking new trades after this many wins in a NY day.", group="Daily Trade Limits")
+enable_daily_loss_limit = input.bool(true, "Enable Loss Halt", group="Daily Trade Limits")
+max_losses_per_day = input.int(1, "Max Losses Per Day", minval=1, tooltip="Stop taking new trades after this many losses in a NY day.", group="Daily Trade Limits")
+
+//=============================================================================
+// CANDLE COLOR FILTER
+//=============================================================================
+use_candle_color_filter = input.bool(false, "Enable Candle Color Filter", group="Entry Filters", tooltip="Only enter when candle color matches signal direction (Green=Long, Red=Short)")
+candle_color_mode = input.string("Current Bar", "Candle Color Check", options=["Current Bar", "Previous Bar"], group="Entry Filters", tooltip="Check candle color on current bar or previous bar")
+
+//=============================================================================
+// SMT DIVERGENCE FILTER (Smart Money Technique)
+//=============================================================================
+use_smt_filter = input.bool(false, "Enable SMT Divergence Filter", group="SMT Filter", tooltip="Compare NQ structure with ES/YM to detect Smart Money divergences")
+smt_reference = input.string("ES", "Reference Instrument", options=["ES", "YM"], group="SMT Filter", tooltip="Compare NQ with ES (S&P500) or YM (Dow Jones)")
+smt_timeframe = input.timeframe("60", "SMT Higher Timeframe", group="SMT Filter", tooltip="Timeframe to detect swing points (e.g., 60=1H, 240=4H, D=Daily)")
+smt_swing_len = input.int(5, "Swing Detection Length", minval=2, maxval=20, group="SMT Filter", tooltip="Bars to look back for swing highs/lows")
+smt_correlation = input.string("Positive", "Correlation Type", options=["Positive", "Negative"], group="SMT Filter", tooltip="Positive: ES/NQ move together. Negative: Inverse correlation")
+smt_require_range = input.bool(true, "Require Price Between Swings", group="SMT Filter", tooltip="Only trade when price is between swing high and swing low on HTF")
+
+//=============================================================================
+// PHASE 1: QUALITY FILTERS
+//=============================================================================
+// IFVG Quality Filter
+use_fvg_quality = input.bool(false, "Enable IFVG Quality Filter", group="Phase 1 - IFVG Quality", tooltip="Filter FVGs by size relative to ATR (WARNING: Very restrictive - test carefully)")
+fvg_quality_mode = input.string("Filter Extremes", "Quality Filter Mode", options=["Filter Extremes", "Strict Range"], group="Phase 1 - IFVG Quality", tooltip="Filter Extremes: Only filter very small/large. Strict Range: Use min/max thresholds")
+atr_len = input.int(14, "ATR Length", minval=1, maxval=200, group="Phase 1 - IFVG Quality")
+fvg_min_atr = input.float(0.2, "Min FVG Size (ATR units)", minval=0.0, maxval=2.0, step=0.1, group="Phase 1 - IFVG Quality", tooltip="Minimum FVG size relative to ATR (0.0 = no minimum, only used in Strict mode)")
+fvg_max_atr = input.float(10.0, "Max FVG Size (ATR units)", minval=1.0, maxval=20.0, step=0.5, group="Phase 1 - IFVG Quality", tooltip="Maximum FVG size relative to ATR (high value = no maximum, only used in Strict mode)")
+fvg_extreme_min = input.float(0.1, "Extreme Min (ATR units)", minval=0.0, maxval=1.0, step=0.05, group="Phase 1 - IFVG Quality", tooltip="Filter out FVGs smaller than this (Filter Extremes mode)")
+fvg_extreme_max = input.float(5.0, "Extreme Max (ATR units)", minval=2.0, maxval=20.0, step=0.5, group="Phase 1 - IFVG Quality", tooltip="Filter out FVGs larger than this (Filter Extremes mode)")
+show_fvg_stats = input.bool(false, "Show FVG Size Stats in Logs", group="Phase 1 - IFVG Quality", tooltip="Log FVG sizes for analysis")
+
+// HTF EMA Slope Filter (Enhanced)
+use_htf_slope = input.bool(false, "Enable HTF EMA Slope Filter", group="Phase 1 - HTF Slope", tooltip="Use normalized EMA slope for trend strength")
+htf_atr_len = input.int(14, "HTF ATR Length", minval=1, maxval=200, group="Phase 1 - HTF Slope")
+min_up_slope = input.float(0.15, "Min HTF EMA Slope Up (ATR units)", minval=0.0, maxval=1.0, step=0.05, group="Phase 1 - HTF Slope", tooltip="Minimum normalized slope for bullish trend")
+min_down_slope = input.float(-0.15, "Min HTF EMA Slope Down (ATR units)", minval=-1.0, maxval=0.0, step=0.05, group="Phase 1 - HTF Slope", tooltip="Minimum normalized slope for bearish trend")
+
+// Time Filter
+time_filter_mode = input.string("Custom Time", "Time Filter Mode", options=["Disabled", "Custom Time", "ICT Killzones", "Specific Hours"], group="Time Filter")
+
+// Custom Time Settings (Time Range)
+start_hour = input.int(9, "Start Hour (0-23)", minval=0, maxval=23, group="Time Filter - Custom Range")
+start_min = input.int(30, "Start Minute (0-59)", minval=0, maxval=59, group="Time Filter - Custom Range")
+end_hour = input.int(16, "End Hour (0-23)", minval=0, maxval=23, group="Time Filter - Custom Range")
+end_min = input.int(0, "End Minute (0-59)", minval=0, maxval=59, group="Time Filter - Custom Range")
+
+// ICT Killzones (All times in NY Time)
+ict_killzone = input.string("New York AM", "ICT Killzone", options=["Asian", "London", "New York AM", "New York PM / London Close", "New York Full Session"], group="Time Filter - ICT Killzones", tooltip="Asian: 8PM-12AM NY | London: 2AM-5AM NY | NY AM: 7AM-10AM NY | NY PM: 10AM-12PM NY | NY Full: 7AM-4PM NY")
+
+// Specific Half-Hours (NY Time) - Select individual 30-min slots to trade
+slot_00_00 = input.bool(false, "12:00 AM", group="Specific Hours - 12AM-6AM")
+slot_00_30 = input.bool(false, "12:30 AM", group="Specific Hours - 12AM-6AM")
+slot_01_00 = input.bool(false, "1:00 AM", group="Specific Hours - 12AM-6AM")
+slot_01_30 = input.bool(false, "1:30 AM", group="Specific Hours - 12AM-6AM")
+slot_02_00 = input.bool(false, "2:00 AM", group="Specific Hours - 12AM-6AM")
+slot_02_30 = input.bool(false, "2:30 AM", group="Specific Hours - 12AM-6AM")
+slot_03_00 = input.bool(false, "3:00 AM", group="Specific Hours - 12AM-6AM")
+slot_03_30 = input.bool(false, "3:30 AM", group="Specific Hours - 12AM-6AM")
+slot_04_00 = input.bool(false, "4:00 AM", group="Specific Hours - 12AM-6AM")
+slot_04_30 = input.bool(false, "4:30 AM", group="Specific Hours - 12AM-6AM")
+slot_05_00 = input.bool(false, "5:00 AM", group="Specific Hours - 12AM-6AM")
+slot_05_30 = input.bool(false, "5:30 AM", group="Specific Hours - 12AM-6AM")
+
+slot_06_00 = input.bool(false, "6:00 AM", group="Specific Hours - 6AM-12PM")
+slot_06_30 = input.bool(false, "6:30 AM", group="Specific Hours - 6AM-12PM")
+slot_07_00 = input.bool(true, "7:00 AM", group="Specific Hours - 6AM-12PM")
+slot_07_30 = input.bool(false, "7:30 AM", group="Specific Hours - 6AM-12PM")
+slot_08_00 = input.bool(false, "8:00 AM", group="Specific Hours - 6AM-12PM")
+slot_08_30 = input.bool(false, "8:30 AM", group="Specific Hours - 6AM-12PM")
+slot_09_00 = input.bool(true, "9:00 AM", group="Specific Hours - 6AM-12PM")
+slot_09_30 = input.bool(false, "9:30 AM", group="Specific Hours - 6AM-12PM")
+slot_10_00 = input.bool(false, "10:00 AM", group="Specific Hours - 6AM-12PM")
+slot_10_30 = input.bool(false, "10:30 AM", group="Specific Hours - 6AM-12PM")
+slot_11_00 = input.bool(false, "11:00 AM", group="Specific Hours - 6AM-12PM")
+slot_11_30 = input.bool(false, "11:30 AM", group="Specific Hours - 6AM-12PM")
+
+slot_12_00 = input.bool(false, "12:00 PM", group="Specific Hours - 12PM-6PM")
+slot_12_30 = input.bool(false, "12:30 PM", group="Specific Hours - 12PM-6PM")
+slot_13_00 = input.bool(false, "1:00 PM", group="Specific Hours - 12PM-6PM")
+slot_13_30 = input.bool(false, "1:30 PM", group="Specific Hours - 12PM-6PM")
+slot_14_00 = input.bool(false, "2:00 PM", group="Specific Hours - 12PM-6PM")
+slot_14_30 = input.bool(false, "2:30 PM", group="Specific Hours - 12PM-6PM")
+slot_15_00 = input.bool(false, "3:00 PM", group="Specific Hours - 12PM-6PM")
+slot_15_30 = input.bool(false, "3:30 PM", group="Specific Hours - 12PM-6PM")
+slot_16_00 = input.bool(false, "4:00 PM", group="Specific Hours - 12PM-6PM")
+slot_16_30 = input.bool(false, "4:30 PM", group="Specific Hours - 12PM-6PM")
+slot_17_00 = input.bool(false, "5:00 PM", group="Specific Hours - 12PM-6PM")
+slot_17_30 = input.bool(false, "5:30 PM", group="Specific Hours - 12PM-6PM")
+
+slot_18_00 = input.bool(false, "6:00 PM", group="Specific Hours - 6PM-12AM")
+slot_18_30 = input.bool(false, "6:30 PM", group="Specific Hours - 6PM-12AM")
+slot_19_00 = input.bool(false, "7:00 PM", group="Specific Hours - 6PM-12AM")
+slot_19_30 = input.bool(false, "7:30 PM", group="Specific Hours - 6PM-12AM")
+slot_20_00 = input.bool(false, "8:00 PM", group="Specific Hours - 6PM-12AM")
+slot_20_30 = input.bool(false, "8:30 PM", group="Specific Hours - 6PM-12AM")
+slot_21_00 = input.bool(false, "9:00 PM", group="Specific Hours - 6PM-12AM")
+slot_21_30 = input.bool(false, "9:30 PM", group="Specific Hours - 6PM-12AM")
+slot_22_00 = input.bool(false, "10:00 PM", group="Specific Hours - 6PM-12AM")
+slot_22_30 = input.bool(false, "10:30 PM", group="Specific Hours - 6PM-12AM")
+slot_23_00 = input.bool(false, "11:00 PM", group="Specific Hours - 6PM-12AM")
+slot_23_30 = input.bool(false, "11:30 PM", group="Specific Hours - 6PM-12AM")
+
+// Days of Week - Direction Settings
+trade_monday = input.string("Both", "Monday", options=["Disabled", "Long Only", "Short Only", "Both"], group="Days of Week")
+trade_tuesday = input.string("Both", "Tuesday", options=["Disabled", "Long Only", "Short Only", "Both"], group="Days of Week")
+trade_wednesday = input.string("Both", "Wednesday", options=["Disabled", "Long Only", "Short Only", "Both"], group="Days of Week")
+trade_thursday = input.string("Both", "Thursday", options=["Disabled", "Long Only", "Short Only", "Both"], group="Days of Week")
+trade_friday = input.string("Both", "Friday", options=["Disabled", "Long Only", "Short Only", "Both"], group="Days of Week")
+trade_saturday = input.string("Disabled", "Saturday", options=["Disabled", "Long Only", "Short Only", "Both"], group="Days of Week")
+trade_sunday = input.string("Disabled", "Sunday", options=["Disabled", "Long Only", "Short Only", "Both"], group="Days of Week")
+
+//=============================================================================
+// PYRAMIDING SETTINGS
+//=============================================================================
+enable_pyramiding = input.bool(false, "Enable Pyramiding", group="Pyramiding", tooltip="Add to winning positions under specific conditions")
+pyramiding_model = input.string("Model 1", "Pyramiding Model", options=["Model 1", "Model 2"], group="Pyramiding", tooltip="Model 1: Max 2 units. Model 2: Max 3 units")
+pyramid_threshold_1r = input.float(1.0, "First Pyramid Threshold (R)", minval=0.5, maxval=5.0, step=0.1, group="Pyramiding", tooltip="Add first pyramid when profit reaches this R multiple (e.g., 1.0 = +1R, 1.5 = +1.5R)")
+pyramid_threshold_2r = input.float(2.0, "Second Pyramid Threshold (R)", minval=1.0, maxval=5.0, step=0.1, group="Pyramiding", tooltip="Add second pyramid when profit reaches this R multiple (Model 2 only, must be > First Threshold)")
+pyramiding_atr_len = input.int(14, "ATR Length for Regime", minval=5, maxval=50, group="Pyramiding", tooltip="ATR period for volatility regime detection")
+atr_dead_threshold = input.float(0.3, "Dead Volatility Threshold", minval=0.1, maxval=1.0, step=0.05, group="Pyramiding", tooltip="ATR percentile below this = dead volatility (no pyramiding)")
+atr_extreme_threshold = input.float(0.9, "Extreme Volatility Threshold", minval=0.5, maxval=1.0, step=0.05, group="Pyramiding", tooltip="ATR percentile above this = extreme volatility (no pyramiding)")
+atr_lookback = input.int(100, "ATR Percentile Lookback", minval=20, maxval=500, group="Pyramiding", tooltip="Bars to look back for ATR percentile calculation")
+breakeven_buffer = input.float(0.0, "Breakeven Buffer (points)", minval=0.0, maxval=10.0, step=0.5, group="Pyramiding", tooltip="Add small buffer to breakeven stop (e.g., 0.5 points for slippage)")
+
+//=============================================================================
+// HELPER FUNCTIONS
+//=============================================================================
+// Get day symbol for display
+get_day_symbol(day_setting) =>
+    day_setting == "Disabled" ? "✗" : day_setting == "Long Only" ? "▲" : day_setting == "Short Only" ? "▼" : "↕"
+
+//=============================================================================
+// TREND FILTERS (Optional - improves trade direction selection)
+//=============================================================================
+// Higher Timeframe Trend Filter
+use_htf_trend = input.bool(false, "Enable HTF Trend Filter", group="Trend Filter - HTF", tooltip="Only take longs when HTF trend is bullish, shorts when bearish")
+htf_timeframe = input.timeframe("60", "Higher Timeframe", group="Trend Filter - HTF", tooltip="Timeframe to check trend (e.g., 60=1H, 240=4H, D=Daily)")
+htf_ema_len = input.int(21, "HTF EMA Length", minval=5, maxval=200, group="Trend Filter - HTF")
+htf_trend_mode = input.string("Price vs EMA", "HTF Trend Mode", options=["Price vs EMA", "EMA Slope", "Both"], group="Trend Filter - HTF", tooltip="How to determine HTF trend direction")
+
+// Current Timeframe EMA Filter
+use_ema_filter = input.bool(false, "Enable EMA Filter", group="Trend Filter - EMA", tooltip="Price must be on correct side of EMA")
+ema_length = input.int(50, "EMA Length", minval=5, maxval=500, group="Trend Filter - EMA")
+ema_mode = input.string("Strict", "EMA Mode", options=["Strict", "Loose"], group="Trend Filter - EMA", tooltip="Strict: Price must be above/below EMA. Loose: Allow if price touched EMA recently")
+
+// ADX Trend Strength Filter  
+use_adx_filter = input.bool(false, "Enable ADX Filter", group="Trend Filter - ADX", tooltip="Only trade when trend is strong enough")
+adx_length = input.int(14, "ADX Length", minval=5, maxval=50, group="Trend Filter - ADX")
+adx_threshold = input.int(20, "Min ADX Value", minval=10, maxval=50, group="Trend Filter - ADX", tooltip="Only trade when ADX > this value")
+adx_di_filter = input.bool(true, "Use DI Direction", group="Trend Filter - ADX", tooltip="Also check +DI/-DI for direction confirmation")
+
+// Market Structure Filter (Swing Highs/Lows)
+use_structure_filter = input.bool(false, "Enable Market Structure Filter", group="Trend Filter - Structure", tooltip="Check for higher highs/lows (bullish) or lower highs/lows (bearish)")
+structure_lookback = input.int(20, "Structure Lookback Bars", minval=5, maxval=100, group="Trend Filter - Structure")
+structure_swing_len = input.int(5, "Swing Detection Length", minval=2, maxval=20, group="Trend Filter - Structure")
+
+// Show filter status on chart
+show_trend_filters = input.bool(true, "Show Trend Filter Status", group="Trend Filter - Display")
+
+//=============================================================================
+// SETTINGS DISPLAY
+//=============================================================================
+show_settings_table = input.bool(true, "Show Settings Table", group="Display", tooltip="Display strategy settings on chart")
+
+// Color Customization for Settings Table
+settings_header_color = input.color(color.yellow, "Header Text Color", group="Display - Settings Colors")
+settings_label_color = input.color(color.white, "Label Text Color", group="Display - Settings Colors")
+settings_value_color = input.color(color.aqua, "Value Text Color", group="Display - Settings Colors")
+settings_sl_color = input.color(color.red, "Stop Loss Color", group="Display - Settings Colors")
+settings_tp_color = input.color(color.lime, "Take Profit Color", group="Display - Settings Colors")
+settings_section_color = input.color(color.gray, "Section Header Color", group="Display - Settings Colors")
+settings_bg_color = input.color(color.new(color.black, 85), "Table Background", group="Display - Settings Colors")
+settings_bg_header = input.color(color.new(color.black, 70), "Header Background", group="Display - Settings Colors")
+settings_bg_section = input.color(color.new(color.black, 60), "Section Background", group="Display - Settings Colors")
+settings_htf_color = input.color(color.blue, "HTF Trend Color", group="Display - Settings Colors")
+settings_ema_color = input.color(color.orange, "EMA Filter Color", group="Display - Settings Colors")
+settings_adx_color = input.color(color.purple, "ADX Filter Color", group="Display - Settings Colors")
+settings_structure_color = input.color(color.yellow, "Structure Filter Color", group="Display - Settings Colors")
+
+wt = signal_pref == "Wick"
+green = color.new(#089981, 80)
+red = color.new(#f23645, 80)
+invis = color.rgb(0,0,0,100)
+
+//=============================================================================
+// UDTs (Same as original indicator)
+//=============================================================================
+type lab
+    int x
+    float y
+    int dir
+
+type fvg
+    int left = na
+    float top = na
+    int right = na
+    float bot = na
+    float mid = na
+    int dir = na
+    int state = na
+    array<lab> labs = na
+    int x_val = na
+
+//=============================================================================
+// CORE VARIABLES
+//=============================================================================
+buffer = 100
+c_top = math.max(open, close)
+c_bot = math.min(open, close)
+
+var bull_fvg_ary = array.new<fvg>()
+var bear_fvg_ary = array.new<fvg>()
+var bull_inv_ary = array.new<fvg>()
+var bear_inv_ary = array.new<fvg>()
+
+// Track signal FVG for logging
+var fvg signal_fvg = na
+
+//=============================================================================
+// FUNCTIONS (Exact copy from indicator)
+//=============================================================================
+fvg_manage(_ary, _inv_ary) =>
+    if _ary.size() >= buffer
+        _ary.shift()
+    if _ary.size() > 0
+        for i = _ary.size()-1 to 0
+            value = _ary.get(i)
+            _dir = value.dir
+            if _dir == 1 and (c_bot < value.bot)
+                value.x_val := time
+                _inv_ary.push(_ary.remove(i))
+            if _dir == -1 and (c_top > value.top)
+                value.x_val := time
+                _inv_ary.push(_ary.remove(i))
+
+inv_manage(_ary) =>
+    fire = false
+    fvg result_fvg = na
+    if _ary.size() >= buffer
+        _ary.shift()
+    if _ary.size() > 0
+        for i = _ary.size()-1 to 0
+            value = _ary.get(i)
+            bx_top = value.top
+            bx_bot = value.bot
+            _dir = value.dir
+            st = value.state
+            
+            if (st == 0 and _dir == 1)
+                value.state := 1
+                value.dir := -1
+            if (_dir == -1 and st == 0)
+                value.state := 1
+                value.dir := 1
+            if st >= 1
+                value.right := time
+            
+            // BEARISH signal: inverted bullish FVG (now dir=-1), price retests from above
+            if (_dir == -1 and st == 1 and close < bx_bot and (wt ? high : close[1]) >= bx_bot and (wt ? high : close[1]) < bx_top)
+                value.labs.push(lab.new(time, bx_top, -1))
+                fire := true
+                result_fvg := value
+            
+            // BULLISH signal: inverted bearish FVG (now dir=1), price retests from below
+            if (_dir == 1 and st == 1 and close > bx_top and (wt ? low : close[1]) <= bx_top and (wt ? low : close[1]) > bx_bot)
+                value.labs.push(lab.new(time, bx_bot, 1))
+                fire := true
+                result_fvg := value
+            
+            if st >= 1 and ((_dir == -1 and c_top > bx_top) or (_dir == 1 and c_bot < bx_bot))
+                _ary.remove(i)
+    
+    [fire, result_fvg]
+
+//=============================================================================
+// FVG DETECTION (Enhanced with Quality Filter)
+//=============================================================================
+// Calculate ATR for quality filtering
+atr5 = ta.atr(atr_len)
+atr = nz(ta.atr(200) * atr_multi, ta.cum(high - low) / (bar_index + 1))
+
+fvg_up = (low > high[2]) and (close[1] > high[2])
+fvg_down = (high < low[2]) and (close[1] < low[2])
+
+// Calculate FVG size and normalize by ATR
+float fvg_size = na
+float fvg_size_atr = na
+bool good_fvg_size = false
+
+if fvg_up
+    fvg_size := math.abs(low - high[2])
+    fvg_size_atr := atr5 > 0 ? fvg_size / atr5 : na
+    if not na(fvg_size_atr)
+        if fvg_quality_mode == "Filter Extremes"
+            // Only filter out extreme outliers
+            good_fvg_size := fvg_size_atr >= fvg_extreme_min and fvg_size_atr <= fvg_extreme_max
+        else
+            // Strict range mode
+            good_fvg_size := fvg_size_atr >= fvg_min_atr and fvg_size_atr <= fvg_max_atr
+        
+        if show_fvg_stats
+            log.info("📊 FVG UP | Size: {0} pts | ATR: {1} | Size/ATR: {2} | Quality: {3}", fvg_size, atr5, fvg_size_atr, good_fvg_size)
+else if fvg_down
+    fvg_size := math.abs(low[2] - high)
+    fvg_size_atr := atr5 > 0 ? fvg_size / atr5 : na
+    if not na(fvg_size_atr)
+        if fvg_quality_mode == "Filter Extremes"
+            // Only filter out extreme outliers
+            good_fvg_size := fvg_size_atr >= fvg_extreme_min and fvg_size_atr <= fvg_extreme_max
+        else
+            // Strict range mode
+            good_fvg_size := fvg_size_atr >= fvg_min_atr and fvg_size_atr <= fvg_max_atr
+        
+        if show_fvg_stats
+            log.info("📊 FVG DOWN | Size: {0} pts | ATR: {1} | Size/ATR: {2} | Quality: {3}", fvg_size, atr5, fvg_size_atr, good_fvg_size)
+
+// Note: Quality is checked at FVG creation, so no need to store for signal time
+
+// Original FVG detection with quality filter
+if fvg_up and math.abs(low - high[2]) > atr
+    // Only add if quality filter passes (or if disabled)
+    if not use_fvg_quality or good_fvg_size
+        array.push(bull_fvg_ary, fvg.new(time[1], low, time, high[2], math.avg(low, high[2]), 1, 0, array.new<lab>(), na))
+
+if fvg_down and math.abs(low[2] - high) > atr
+    // Only add if quality filter passes (or if disabled)
+    if not use_fvg_quality or good_fvg_size
+        array.push(bear_fvg_ary, fvg.new(time[1], low[2], time, high, math.avg(high, low[2]), -1, 0, array.new<lab>(), na))
+
+//=============================================================================
+// RUN SIGNAL DETECTION (Same order as indicator)
+//=============================================================================
+fvg_manage(bull_fvg_ary, bull_inv_ary)
+fvg_manage(bear_fvg_ary, bear_inv_ary)
+
+// IMPORTANT: Same assignment as indicator
+// bear_signal comes from bull_inv_ary (inverted bullish FVGs)
+// bull_signal comes from bear_inv_ary (inverted bearish FVGs)
+[bear_signal_raw, bear_fvg_data] = inv_manage(bull_inv_ary)
+[bull_signal_raw, bull_fvg_data] = inv_manage(bear_inv_ary)
+
+//=============================================================================
+// TIME FILTER (must be before signal logging)
+//=============================================================================
+// Get current hour and minute in NY timezone (for ICT Killzones)
+ny_tz = "America/New_York"
+current_hour_ny = hour(time, ny_tz)
+current_min_ny = minute(time, ny_tz)
+current_time_mins_ny = current_hour_ny * 60 + current_min_ny
+current_year_ny = year(time, ny_tz)
+current_month_ny = month(time, ny_tz)
+current_dom_ny = dayofmonth(time, ny_tz)
+current_day_id = current_year_ny * 10000 + current_month_ny * 100 + current_dom_ny
+
+// Track daily performance for trade halts
+var int last_day_id = na
+var int daily_win_count = 0
+var int daily_loss_count = 0
+var bool daily_trading_stopped = false
+var string daily_stop_reason = ""
+var int last_closed_trade_idx = 0
+
+if na(last_day_id) or current_day_id != last_day_id
+    last_day_id := current_day_id
+    daily_win_count := 0
+    daily_loss_count := 0
+    daily_trading_stopped := false
+    daily_stop_reason := ""
+
+// Update daily win/loss counters from closed trades
+closed_trades_total = strategy.closedtrades
+if closed_trades_total > last_closed_trade_idx
+    for trade_idx = last_closed_trade_idx to closed_trades_total - 1
+        entry_id = strategy.closedtrades.entry_id(trade_idx)
+        if entry_id == "Long" or entry_id == "Short"
+            trade_profit = strategy.closedtrades.profit(trade_idx)
+            if trade_profit > 0
+                daily_win_count += 1
+                if enable_daily_win_limit and daily_win_count >= max_wins_per_day and not daily_trading_stopped
+                    daily_trading_stopped := true
+                    daily_stop_reason := str.format("{0} Wins", daily_win_count)
+                    log.info("🛑 Daily trading halted after {0} wins (Day {1})", daily_win_count, current_day_id)
+            else if trade_profit < 0
+                daily_loss_count += 1
+                if enable_daily_loss_limit and daily_loss_count >= max_losses_per_day and not daily_trading_stopped
+                    daily_trading_stopped := true
+                    daily_stop_reason := str.format("{0} Loss", daily_loss_count)
+                    log.info("🛑 Daily trading halted after {0} losses (Day {1})", daily_loss_count, current_day_id)
+    last_closed_trade_idx := closed_trades_total
+
+// Get day of week (1=Sunday, 2=Monday, ... 7=Saturday)
+current_dow = dayofweek(time, ny_tz)
+
+// Get current day's trading direction setting
+current_day_setting = switch current_dow
+    1 => trade_sunday
+    2 => trade_monday
+    3 => trade_tuesday
+    4 => trade_wednesday
+    5 => trade_thursday
+    6 => trade_friday
+    7 => trade_saturday
+    => "Disabled"
+
+// Check if current day allows longs and shorts based on day setting
+day_allows_long = current_day_setting == "Both" or current_day_setting == "Long Only"
+day_allows_short = current_day_setting == "Both" or current_day_setting == "Short Only"
+day_allowed = current_day_setting != "Disabled"  // For backward compatibility with logging
+
+// ICT Killzone times (in NY time, minutes from midnight)
+// Asian: 8:00 PM - 12:00 AM (20:00-00:00)
+// London: 2:00 AM - 5:00 AM (02:00-05:00)
+// New York AM: 7:00 AM - 10:00 AM (07:00-10:00)
+// New York PM / London Close: 10:00 AM - 12:00 PM (10:00-12:00)
+// New York Full Session: 7:00 AM - 4:00 PM (07:00-16:00)
+
+get_killzone_times(kz) =>
+    switch kz
+        "Asian" => [20 * 60, 24 * 60]  // 20:00 - 00:00 (overnight)
+        "London" => [2 * 60, 5 * 60]    // 02:00 - 05:00
+        "New York AM" => [7 * 60, 10 * 60]  // 07:00 - 10:00
+        "New York PM / London Close" => [10 * 60, 12 * 60]  // 10:00 - 12:00
+        "New York Full Session" => [7 * 60, 16 * 60]  // 07:00 - 16:00
+        => [0, 24 * 60]  // Default: all day
+
+[kz_start, kz_end] = get_killzone_times(ict_killzone)
+
+// Check if current 30-min slot is allowed
+// Slot index = hour * 2 + (minute >= 30 ? 1 : 0)
+current_slot = current_hour_ny * 2 + (current_min_ny >= 30 ? 1 : 0)
+
+slot_allowed = switch current_slot
+    0 => slot_00_00
+    1 => slot_00_30
+    2 => slot_01_00
+    3 => slot_01_30
+    4 => slot_02_00
+    5 => slot_02_30
+    6 => slot_03_00
+    7 => slot_03_30
+    8 => slot_04_00
+    9 => slot_04_30
+    10 => slot_05_00
+    11 => slot_05_30
+    12 => slot_06_00
+    13 => slot_06_30
+    14 => slot_07_00
+    15 => slot_07_30
+    16 => slot_08_00
+    17 => slot_08_30
+    18 => slot_09_00
+    19 => slot_09_30
+    20 => slot_10_00
+    21 => slot_10_30
+    22 => slot_11_00
+    23 => slot_11_30
+    24 => slot_12_00
+    25 => slot_12_30
+    26 => slot_13_00
+    27 => slot_13_30
+    28 => slot_14_00
+    29 => slot_14_30
+    30 => slot_15_00
+    31 => slot_15_30
+    32 => slot_16_00
+    33 => slot_16_30
+    34 => slot_17_00
+    35 => slot_17_30
+    36 => slot_18_00
+    37 => slot_18_30
+    38 => slot_19_00
+    39 => slot_19_30
+    40 => slot_20_00
+    41 => slot_20_30
+    42 => slot_21_00
+    43 => slot_21_30
+    44 => slot_22_00
+    45 => slot_22_30
+    46 => slot_23_00
+    47 => slot_23_30
+    => false
+
+// CONFLICT RESOLUTION: If both signals fire on same bar, take NEITHER (ambiguous)
+both_signals = bull_signal_raw and bear_signal_raw
+bull_signal = bull_signal_raw and not bear_signal_raw  // Only if no bear signal
+bear_signal = bear_signal_raw and not bull_signal_raw  // Only if no bull signal
+
+// DEBUG: Log signal detection with TIME INFO
+if both_signals
+    log.warning("⚠️ CONFLICT: Both BULL and BEAR signals on same bar | Close: {0} | Hour(NY): {1} | SKIPPING BOTH", close, current_hour_ny)
+if bull_signal
+    day_status_long = day_allows_long ? "✅" : "❌"
+    log.info("🟢 BULL SIGNAL DETECTED | Close: {0} | Hour(NY): {1}:{2} | slot_allowed: {3} | day_allows_long: {4} ({5})", close, current_hour_ny, current_min_ny, slot_allowed, day_allows_long, current_day_setting)
+if bear_signal
+    day_status_short = day_allows_short ? "✅" : "❌"
+    log.info("🔴 BEAR SIGNAL DETECTED | Close: {0} | Hour(NY): {1}:{2} | slot_allowed: {3} | day_allows_short: {4} ({5})", close, current_hour_ny, current_min_ny, slot_allowed, day_allows_short, current_day_setting)
+
+// Determine time window based on mode
+in_time_window = true
+if time_filter_mode == "Custom Time"
+    start_time_mins = start_hour * 60 + start_min
+    end_time_mins = end_hour * 60 + end_min
+    if start_time_mins <= end_time_mins
+        in_time_window := current_time_mins_ny >= start_time_mins and current_time_mins_ny < end_time_mins
+    else
+        in_time_window := current_time_mins_ny >= start_time_mins or current_time_mins_ny < end_time_mins
+else if time_filter_mode == "ICT Killzones"
+    if kz_start <= kz_end
+        in_time_window := current_time_mins_ny >= kz_start and current_time_mins_ny < kz_end
+    else
+        // Overnight (e.g., Asian session 20:00-00:00)
+        in_time_window := current_time_mins_ny >= kz_start or current_time_mins_ny < kz_end
+else if time_filter_mode == "Specific Hours"
+    in_time_window := slot_allowed
+
+// Combine time window with day direction filters
+// Time window must be valid AND day must allow the specific direction
+in_trading_window_long = in_time_window and day_allows_long
+in_trading_window_short = in_time_window and day_allows_short
+in_trading_window = in_time_window and day_allowed  // For backward compatibility with logging
+
+// Visual indicator for time/day window
+bgcolor(time_filter_mode != "Disabled" and not in_trading_window ? color.new(color.gray, 95) : na)
+
+//=============================================================================
+// TREND FILTERS LOGIC
+//=============================================================================
+
+// --- Higher Timeframe Trend (Enhanced with Normalized Slope) ---
+htf_close = request.security(syminfo.tickerid, htf_timeframe, close, barmerge.gaps_off, barmerge.lookahead_off)
+htf_ema = request.security(syminfo.tickerid, htf_timeframe, ta.ema(close, htf_ema_len), barmerge.gaps_off, barmerge.lookahead_off)
+htf_ema_prev = request.security(syminfo.tickerid, htf_timeframe, ta.ema(close, htf_ema_len)[1], barmerge.gaps_off, barmerge.lookahead_off)
+
+// Get HTF ATR for slope normalization
+htf_atr = request.security(syminfo.tickerid, htf_timeframe, ta.atr(htf_atr_len), barmerge.gaps_off, barmerge.lookahead_off)
+
+// Calculate normalized EMA slope
+ema_slope = htf_ema - htf_ema_prev
+ema_slope_norm = htf_atr > 0 ? ema_slope / htf_atr : 0.0
+
+// Trend strength filters (if slope filter enabled)
+strong_up_trend = not use_htf_slope or ema_slope_norm >= min_up_slope
+strong_down_trend = not use_htf_slope or ema_slope_norm <= min_down_slope
+
+// Price position relative to HTF EMA
+above_htf_ema = htf_close > htf_ema
+below_htf_ema = htf_close < htf_ema
+
+// HTF trend determination (enhanced)
+htf_price_above_ema = htf_close > htf_ema
+htf_ema_rising = htf_ema > htf_ema_prev
+
+// Combine slope filter with existing mode
+htf_bullish = switch htf_trend_mode
+    "Price vs EMA" => htf_price_above_ema and (not use_htf_slope or strong_up_trend)
+    "EMA Slope" => (not use_htf_slope or strong_up_trend) and htf_ema_rising
+    "Both" => htf_price_above_ema and htf_ema_rising and (not use_htf_slope or strong_up_trend)
+    => true
+
+htf_bearish = switch htf_trend_mode
+    "Price vs EMA" => not htf_price_above_ema and (not use_htf_slope or strong_down_trend)
+    "EMA Slope" => (not use_htf_slope or strong_down_trend) and not htf_ema_rising
+    "Both" => not htf_price_above_ema and not htf_ema_rising and (not use_htf_slope or strong_down_trend)
+    => true
+
+// Apply HTF filter (or pass through if disabled)
+htf_allows_long = use_htf_trend ? htf_bullish : true
+htf_allows_short = use_htf_trend ? htf_bearish : true
+
+// --- Current Timeframe EMA Filter ---
+ema_value = ta.ema(close, ema_length)
+ema_touched_recently = ta.lowest(low, 3) <= ema_value and ta.highest(high, 3) >= ema_value
+
+ema_allows_long = not use_ema_filter ? true : (ema_mode == "Strict" ? close > ema_value : (close > ema_value or ema_touched_recently))
+ema_allows_short = not use_ema_filter ? true : (ema_mode == "Strict" ? close < ema_value : (close < ema_value or ema_touched_recently))
+
+// --- ADX Trend Strength Filter ---
+[di_plus, di_minus, adx_value] = ta.dmi(adx_length, adx_length)
+
+adx_strong_enough = adx_value >= adx_threshold
+adx_di_bullish = di_plus > di_minus
+adx_di_bearish = di_minus > di_plus
+
+adx_allows_long = not use_adx_filter ? true : (adx_strong_enough and (not adx_di_filter or adx_di_bullish))
+adx_allows_short = not use_adx_filter ? true : (adx_strong_enough and (not adx_di_filter or adx_di_bearish))
+
+// --- Market Structure Filter ---
+// Detect swing highs and lows
+swing_high = ta.pivothigh(high, structure_swing_len, structure_swing_len)
+swing_low = ta.pivotlow(low, structure_swing_len, structure_swing_len)
+
+// Track recent swing points
+var float last_swing_high = na
+var float prev_swing_high = na
+var float last_swing_low = na
+var float prev_swing_low = na
+
+if not na(swing_high)
+    prev_swing_high := last_swing_high
+    last_swing_high := swing_high
+
+if not na(swing_low)
+    prev_swing_low := last_swing_low
+    last_swing_low := swing_low
+
+// Determine structure
+higher_highs = not na(last_swing_high) and not na(prev_swing_high) and last_swing_high > prev_swing_high
+higher_lows = not na(last_swing_low) and not na(prev_swing_low) and last_swing_low > prev_swing_low
+lower_highs = not na(last_swing_high) and not na(prev_swing_high) and last_swing_high < prev_swing_high
+lower_lows = not na(last_swing_low) and not na(prev_swing_low) and last_swing_low < prev_swing_low
+
+bullish_structure = higher_highs or higher_lows
+bearish_structure = lower_highs or lower_lows
+
+structure_allows_long = not use_structure_filter ? true : bullish_structure
+structure_allows_short = not use_structure_filter ? true : bearish_structure
+
+// --- Combined Trend Filter Results ---
+trend_allows_long = htf_allows_long and ema_allows_long and adx_allows_long and structure_allows_long
+trend_allows_short = htf_allows_short and ema_allows_short and adx_allows_short and structure_allows_short
+
+// Plot EMA if enabled
+plot(use_ema_filter ? ema_value : na, "EMA", color=color.new(color.orange, 0), linewidth=2)
+
+//=============================================================================
+// CANDLE COLOR FILTER LOGIC
+//=============================================================================
+// Determine candle color using OHLC (green = bullish, red = bearish)
+// Green candle: close > open (bullish)
+// Red candle: close < open (bearish)
+// Neutral: close == open (doji)
+
+// Check on current bar or previous bar based on mode
+check_bar = candle_color_mode == "Current Bar" ? 0 : 1
+check_close = close[check_bar]
+check_open = open[check_bar]
+
+candle_is_green = check_close > check_open  // Bullish candle
+candle_is_red = check_close < check_open    // Bearish candle
+candle_is_neutral = check_close == check_open  // Doji/neutral
+
+// Candle color filter results
+candle_allows_long = not use_candle_color_filter or candle_is_green or candle_is_neutral  // Allow green or neutral candles for longs
+candle_allows_short = not use_candle_color_filter or candle_is_red or candle_is_neutral   // Allow red or neutral candles for shorts
+
+//=============================================================================
+// SMT DIVERGENCE FILTER LOGIC
+//=============================================================================
+// Get reference instrument symbol (ES or YM futures)
+smt_symbol = smt_reference == "ES" ? "ES1!" : "YM1!"
+
+// Get swing highs/lows on HTF for NQ (current chart)
+nq_swing_high = request.security(syminfo.tickerid, smt_timeframe, ta.pivothigh(high, smt_swing_len, smt_swing_len), barmerge.gaps_off, barmerge.lookahead_off)
+nq_swing_low = request.security(syminfo.tickerid, smt_timeframe, ta.pivotlow(low, smt_swing_len, smt_swing_len), barmerge.gaps_off, barmerge.lookahead_off)
+
+// Get swing highs/lows on HTF for reference instrument (ES or YM)
+ref_swing_high = request.security(smt_symbol, smt_timeframe, ta.pivothigh(high, smt_swing_len, smt_swing_len), barmerge.gaps_off, barmerge.lookahead_off)
+ref_swing_low = request.security(smt_symbol, smt_timeframe, ta.pivotlow(low, smt_swing_len, smt_swing_len), barmerge.gaps_off, barmerge.lookahead_off)
+
+// Track recent swing points for NQ
+var float nq_last_swing_high = na
+var float nq_prev_swing_high = na
+var float nq_last_swing_low = na
+var float nq_prev_swing_low = na
+
+// Track recent swing points for reference instrument
+var float ref_last_swing_high = na
+var float ref_prev_swing_high = na
+var float ref_last_swing_low = na
+var float ref_prev_swing_low = na
+
+// Update NQ swings
+if not na(nq_swing_high)
+    nq_prev_swing_high := nq_last_swing_high
+    nq_last_swing_high := nq_swing_high
+
+if not na(nq_swing_low)
+    nq_prev_swing_low := nq_last_swing_low
+    nq_last_swing_low := nq_swing_low
+
+// Update reference instrument swings
+if not na(ref_swing_high)
+    ref_prev_swing_high := ref_last_swing_high
+    ref_last_swing_high := ref_swing_high
+
+if not na(ref_swing_low)
+    ref_prev_swing_low := ref_last_swing_low
+    ref_last_swing_low := ref_swing_low
+
+// Determine market structure for both instruments
+nq_higher_high = not na(nq_last_swing_high) and not na(nq_prev_swing_high) and nq_last_swing_high > nq_prev_swing_high
+nq_lower_high = not na(nq_last_swing_high) and not na(nq_prev_swing_high) and nq_last_swing_high < nq_prev_swing_high
+nq_higher_low = not na(nq_last_swing_low) and not na(nq_prev_swing_low) and nq_last_swing_low > nq_prev_swing_low
+nq_lower_low = not na(nq_last_swing_low) and not na(nq_prev_swing_low) and nq_last_swing_low < nq_prev_swing_low
+
+ref_higher_high = not na(ref_last_swing_high) and not na(ref_prev_swing_high) and ref_last_swing_high > ref_prev_swing_high
+ref_lower_high = not na(ref_last_swing_high) and not na(ref_prev_swing_high) and ref_last_swing_high < ref_prev_swing_high
+ref_higher_low = not na(ref_last_swing_low) and not na(ref_prev_swing_low) and ref_last_swing_low > ref_prev_swing_low
+ref_lower_low = not na(ref_last_swing_low) and not na(ref_prev_swing_low) and ref_last_swing_low < ref_prev_swing_low
+
+// SMT Divergence Detection
+// Bullish SMT Divergence (Smart Money Accumulation):
+// - Positive correlation: NQ makes lower low, but ES makes higher low (NQ weak, ES strong = bullish reversal)
+// - Negative correlation: NQ makes lower low, but ES makes lower high (different structure = bullish reversal)
+bullish_smt = false
+if smt_correlation == "Positive"
+    bullish_smt := nq_lower_low and ref_higher_low  // NQ weak, ES strong = accumulation signal
+else
+    bullish_smt := nq_lower_low and ref_lower_high  // NQ weak, ES also weak but different structure
+
+// Bearish SMT Divergence (Smart Money Distribution):
+// - Positive correlation: NQ makes higher high, but ES makes lower high (NQ strong, ES weak = bearish reversal)
+// - Negative correlation: NQ makes higher high, but ES makes higher low (different structure = bearish reversal)
+bearish_smt = false
+if smt_correlation == "Positive"
+    bearish_smt := nq_higher_high and ref_lower_high  // NQ strong, ES weak = distribution signal
+else
+    bearish_smt := nq_higher_high and ref_higher_low  // NQ strong, ES also strong but different structure
+
+// Get current price on HTF to check if between swing high/low
+htf_close_nq = request.security(syminfo.tickerid, smt_timeframe, close, barmerge.gaps_off, barmerge.lookahead_off)
+
+// Check if price is between swing high and swing low on HTF
+price_between_swings = true  // Default to true if filter disabled
+if use_smt_filter and smt_require_range
+    if not na(nq_last_swing_high) and not na(nq_last_swing_low)
+        price_between_swings := htf_close_nq >= nq_last_swing_low and htf_close_nq <= nq_last_swing_high
+    else
+        price_between_swings := false  // No swings detected yet
+
+// SMT Filter Results
+smt_allows_long = not use_smt_filter or (bullish_smt and price_between_swings)
+smt_allows_short = not use_smt_filter or (bearish_smt and price_between_swings)
+
+//=============================================================================
+// ATR REGIME DETECTION (for Pyramiding - only calculated if pyramiding enabled)
+//=============================================================================
+// Only calculate ATR regime if pyramiding is enabled (optimization)
+atr_regime_normal = true  // Default to normal (allows pyramiding if enabled)
+atr_regime_dead = false
+atr_regime_extreme = false
+
+if enable_pyramiding
+    atr_current = ta.atr(pyramiding_atr_len)
+    // Calculate ATR percentile over lookback period
+    var array<float> atr_history = array.new<float>()
+    if bar_index < atr_lookback
+        array.push(atr_history, atr_current)
+    else
+        array.shift(atr_history)
+        array.push(atr_history, atr_current)
+
+    // Calculate percentile
+    atr_percentile = 0.5  // Default to middle
+    if array.size(atr_history) >= 20
+        // Count how many ATR values are below current
+        below_count = 0.0
+        for i = 0 to array.size(atr_history) - 1
+            if array.get(atr_history, i) < atr_current
+                below_count += 1
+        atr_percentile := below_count / array.size(atr_history)
+
+    // Determine ATR regime
+    atr_regime_normal := atr_percentile >= atr_dead_threshold and atr_percentile <= atr_extreme_threshold
+    atr_regime_dead := atr_percentile < atr_dead_threshold
+    atr_regime_extreme := atr_percentile > atr_extreme_threshold
+
+//=============================================================================
+// STRATEGY ENTRIES
+//=============================================================================
+// Direction logic: Day-specific filters override global filter
+// If global is "Disabled", use day-specific filters only
+// If global is anything else, day-specific filters override it (take precedence)
+// So we always use day-specific filters
+can_long = day_allows_long
+can_short = day_allows_short
+no_position = strategy.position_size == 0
+
+// Show CONFLICT label when both signals fire
+if both_signals
+    label.new(bar_index, high, "⚠️ CONFLICT\nBOTH SIGNALS", style=label.style_label_down, color=color.orange, textcolor=color.white, size=size.small)
+
+// LONG entry on bullish signal (only if no conflict)
+if bull_signal
+    // Note: FVG quality is already checked at FVG creation time, so if signal fires, FVG passed quality
+    log.info("  → Checking LONG: can={0}, no_pos={1}, time_ok={2}, day_ok={3}, trend_ok={4}, candle_ok={5}, smt_ok={6}", can_long, no_position, in_time_window, day_allows_long, trend_allows_long, candle_allows_long, smt_allows_long)
+    
+    // Detailed HTF logging if enabled
+    if use_htf_trend and not htf_allows_long
+        log.warning("  📊 HTF TREND BLOCKING LONG | Mode: {0} | HTF Close: {1} | HTF EMA: {2} | Price>EMA: {3} | EMA Rising: {4} | Slope: {5} | Bullish: {6}", htf_trend_mode, htf_close, htf_ema, htf_price_above_ema, htf_ema_rising, ema_slope_norm, htf_bullish)
+    
+    // Candle color logging if enabled
+    if use_candle_color_filter and not candle_allows_long
+        candle_status = candle_is_green ? "GREEN ✓" : candle_is_red ? "RED ✗" : "NEUTRAL"
+        log.warning("  🕯️ CANDLE COLOR BLOCKING LONG | Candle: {0} | Close: {1} | Open: {2} | Mode: {3} | Need: GREEN", candle_status, check_close, check_open, candle_color_mode)
+    else if use_candle_color_filter
+        candle_status = candle_is_green ? "GREEN ✓" : candle_is_red ? "RED" : "NEUTRAL"
+        log.info("  🕯️ CANDLE COLOR OK FOR LONG | Candle: {0} | Close: {1} | Open: {2}", candle_status, check_close, check_open)
+    
+    // SMT logging if enabled
+    if use_smt_filter
+        if bullish_smt and price_between_swings
+            log.info("  🔵 BULLISH SMT DETECTED | NQ: Lower Low | {0}: Higher Low | Divergence confirmed | Price in Range: {1}", smt_reference, price_between_swings)
+        else if not smt_allows_long
+            nq_struct = nq_lower_low ? "Lower Low" : nq_higher_low ? "Higher Low" : nq_higher_high ? "Higher High" : nq_lower_high ? "Lower High" : "No Structure"
+            ref_struct = ref_higher_low ? "Higher Low" : ref_lower_high ? "Lower High" : ref_higher_high ? "Higher High" : ref_lower_low ? "Lower Low" : "No Structure"
+            log.warning("  ⚠️ NO SMT DIVERGENCE | NQ Structure: {0} | {1} Structure: {2} | Price in Range: {3} | Waiting for divergence", nq_struct, smt_reference, ref_struct, price_between_swings)
+    
+    if can_long and no_position and in_trading_window_long and trend_allows_long and candle_allows_long and smt_allows_long and not daily_trading_stopped
+        strategy.entry("Long", strategy.long)
+        label.new(bar_index, low, "▲ LONG @" + str.tostring(current_hour_ny) + "h\n" + str.tostring(close, "#.##"), style=label.style_label_up, color=color.teal, textcolor=color.white, size=size.small)
+        log.info("  ✅ LONG TRADE ENTERED at {0} | NY Hour: {1}", close, current_hour_ny)
+    else
+        reason = daily_trading_stopped ? "DAYLIMIT" : not day_allows_long ? "DAY" : not in_time_window ? "TIME" : not trend_allows_long ? "TREND" : not candle_allows_long ? "CANDLE" : not smt_allows_long ? "SMT" : "POS"
+        
+        // Enhanced label with candle color info
+        label_text = "▲ SKIP\n" + reason
+        if daily_trading_stopped
+            label_text := "▲ SKIP\nHALTED\n" + daily_stop_reason
+        if not day_allows_long
+            label_text := "▲ SKIP\nDAY:" + current_day_setting + "\nNeed:Both/Long"
+        else if not candle_allows_long and use_candle_color_filter
+            candle_status = candle_is_red ? "RED" : "NEUTRAL"
+            label_text := "▲ SKIP\nCANDLE:" + candle_status + "\nNeed:GREEN"
+        else if not smt_allows_long and use_smt_filter
+            label_text := "▲ SKIP\nSMT:NO DIV"
+        
+        label.new(bar_index, low, label_text, style=label.style_label_up, color=color.gray, textcolor=color.white, size=size.tiny)
+        
+        // Enhanced logging
+        if not day_allows_long
+            log.warning("  ⚠️ LONG SKIPPED: Day Direction | Current Day Setting: {0} | Global: {1} | Day-Specific Overrides | Need: Both or Long Only", current_day_setting, trade_dir)
+        else if not smt_allows_long and use_smt_filter
+            nq_struct = nq_lower_low ? "Lower Low" : nq_higher_low ? "Higher Low" : nq_higher_high ? "Higher High" : nq_lower_high ? "Lower High" : "No Structure"
+            ref_struct = ref_higher_low ? "Higher Low" : ref_lower_high ? "Lower High" : ref_higher_high ? "Higher High" : ref_lower_low ? "Lower Low" : "No Structure"
+            log.warning("  ⚠️ LONG SKIPPED: SMT Divergence | NQ: {0} | {1}: {2} | Price in Range: {3}", nq_struct, smt_reference, ref_struct, price_between_swings)
+        else if not candle_allows_long
+            candle_status = candle_is_green ? "GREEN" : candle_is_red ? "RED" : "NEUTRAL"
+            log.warning("  ⚠️ LONG SKIPPED: Candle Color | Candle: {0} (Close:{1} Open:{2}) | Need: GREEN (Close>Open)", candle_status, check_close, check_open)
+        else if not trend_allows_long and use_htf_trend
+            log.info("  ❌ LONG SKIPPED: {0} | HTF:{1} (Close:{2} EMA:{3} Slope:{4}) EMA:{5} ADX:{6} STRUCT:{7}", reason, htf_allows_long, htf_close, htf_ema, ema_slope_norm, ema_allows_long, adx_allows_long, structure_allows_long)
+        else if daily_trading_stopped
+            log.info("  ❌ LONG SKIPPED: Daily halt active ({0}) | Wins: {1} | Losses: {2}", daily_stop_reason, daily_win_count, daily_loss_count)
+        else
+            log.info("  ❌ LONG SKIPPED: {0} | HTF:{1} EMA:{2} ADX:{3} STRUCT:{4}", reason, htf_allows_long, ema_allows_long, adx_allows_long, structure_allows_long)
+
+// SHORT entry on bearish signal (only if no conflict)
+if bear_signal
+    // Note: FVG quality is already checked at FVG creation time, so if signal fires, FVG passed quality
+    log.info("  → Checking SHORT: can={0}, no_pos={1}, time_ok={2}, day_ok={3}, trend_ok={4}, candle_ok={5}, smt_ok={6}", can_short, no_position, in_time_window, day_allows_short, trend_allows_short, candle_allows_short, smt_allows_short)
+    
+    // Detailed HTF logging if enabled
+    if use_htf_trend and not htf_allows_short
+        log.warning("  📊 HTF TREND BLOCKING SHORT | Mode: {0} | HTF Close: {1} | HTF EMA: {2} | Price<EMA: {3} | EMA Falling: {4} | Slope: {5} | Bearish: {6}", htf_trend_mode, htf_close, htf_ema, not htf_price_above_ema, not htf_ema_rising, ema_slope_norm, htf_bearish)
+    
+    // Candle color logging if enabled
+    if use_candle_color_filter and not candle_allows_short
+        candle_status = candle_is_red ? "RED ✓" : candle_is_green ? "GREEN ✗" : "NEUTRAL"
+        log.warning("  🕯️ CANDLE COLOR BLOCKING SHORT | Candle: {0} | Close: {1} | Open: {2} | Mode: {3} | Need: RED", candle_status, check_close, check_open, candle_color_mode)
+    else if use_candle_color_filter
+        candle_status = candle_is_red ? "RED ✓" : candle_is_green ? "GREEN" : "NEUTRAL"
+        log.info("  🕯️ CANDLE COLOR OK FOR SHORT | Candle: {0} | Close: {1} | Open: {2}", candle_status, check_close, check_open)
+    
+    // SMT logging if enabled
+    if use_smt_filter
+        if bearish_smt and price_between_swings
+            log.info("  🔴 BEARISH SMT DETECTED | NQ: Higher High | {0}: Lower High | Divergence confirmed | Price in Range: {1}", smt_reference, price_between_swings)
+        else if not smt_allows_short
+            nq_struct = nq_higher_high ? "Higher High" : nq_lower_high ? "Lower High" : nq_lower_low ? "Lower Low" : nq_higher_low ? "Higher Low" : "No Structure"
+            ref_struct = ref_lower_high ? "Lower High" : ref_higher_low ? "Higher Low" : ref_higher_high ? "Higher High" : ref_lower_low ? "Lower Low" : "No Structure"
+            log.warning("  ⚠️ NO SMT DIVERGENCE | NQ Structure: {0} | {1} Structure: {2} | Price in Range: {3} | Waiting for divergence", nq_struct, smt_reference, ref_struct, price_between_swings)
+    
+    if can_short and no_position and in_trading_window_short and trend_allows_short and candle_allows_short and smt_allows_short and not daily_trading_stopped
+        strategy.entry("Short", strategy.short)
+        label.new(bar_index, high, "▼ SHORT @" + str.tostring(current_hour_ny) + "h\n" + str.tostring(close, "#.##"), style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
+        log.info("  ✅ SHORT TRADE ENTERED at {0} | NY Hour: {1}", close, current_hour_ny)
+    else
+        reason = daily_trading_stopped ? "DAYLIMIT" : not day_allows_short ? "DAY" : not in_time_window ? "TIME" : not trend_allows_short ? "TREND" : not candle_allows_short ? "CANDLE" : not smt_allows_short ? "SMT" : "POS"
+        
+        // Enhanced label with candle color info
+        label_text = "▼ SKIP\n" + reason
+        if daily_trading_stopped
+            label_text := "▼ SKIP\nHALTED\n" + daily_stop_reason
+        if not day_allows_short
+            label_text := "▼ SKIP\nDAY:" + current_day_setting + "\nNeed:Both/Short"
+        else if not candle_allows_short and use_candle_color_filter
+            candle_status = candle_is_green ? "GREEN" : "NEUTRAL"
+            label_text := "▼ SKIP\nCANDLE:" + candle_status + "\nNeed:RED"
+        else if not smt_allows_short and use_smt_filter
+            label_text := "▼ SKIP\nSMT:NO DIV"
+        
+        label.new(bar_index, high, label_text, style=label.style_label_down, color=color.gray, textcolor=color.white, size=size.tiny)
+        
+        // Enhanced logging
+        if not day_allows_short
+            log.warning("  ⚠️ SHORT SKIPPED: Day Direction | Current Day Setting: {0} | Global: {1} | Day-Specific Overrides | Need: Both or Short Only", current_day_setting, trade_dir)
+        else if not smt_allows_short and use_smt_filter
+            nq_struct = nq_higher_high ? "Higher High" : nq_lower_high ? "Lower High" : nq_lower_low ? "Lower Low" : nq_higher_low ? "Higher Low" : "No Structure"
+            ref_struct = ref_lower_high ? "Lower High" : ref_higher_low ? "Higher Low" : ref_higher_high ? "Higher High" : ref_lower_low ? "Lower Low" : "No Structure"
+            log.warning("  ⚠️ SHORT SKIPPED: SMT Divergence | NQ: {0} | {1}: {2} | Price in Range: {3}", nq_struct, smt_reference, ref_struct, price_between_swings)
+        else if not candle_allows_short
+            candle_status = candle_is_red ? "RED" : candle_is_green ? "GREEN" : "NEUTRAL"
+            log.warning("  ⚠️ SHORT SKIPPED: Candle Color | Candle: {0} (Close:{1} Open:{2}) | Need: RED (Close<Open)", candle_status, check_close, check_open)
+        else if not trend_allows_short and use_htf_trend
+            log.info("  ❌ SHORT SKIPPED: {0} | HTF:{1} (Close:{2} EMA:{3} Slope:{4}) EMA:{5} ADX:{6} STRUCT:{7}", reason, htf_allows_short, htf_close, htf_ema, ema_slope_norm, ema_allows_short, adx_allows_short, structure_allows_short)
+        else if daily_trading_stopped
+            log.info("  ❌ SHORT SKIPPED: Daily halt active ({0}) | Wins: {1} | Losses: {2}", daily_stop_reason, daily_win_count, daily_loss_count)
+        else
+            log.info("  ❌ SHORT SKIPPED: {0} | HTF:{1} EMA:{2} ADX:{3} STRUCT:{4}", reason, htf_allows_short, ema_allows_short, adx_allows_short, structure_allows_short)
+
+//=============================================================================
+// PYRAMIDING LOGIC
+//=============================================================================
+// Track pyramiding state
+var bool pyramid_added_1r = false
+var bool pyramid_added_2r = false
+var float pyramid_base_entry = na
+var string pyramid_base_direction = na
+var float pyramid_1r_entry = na
+var float pyramid_2r_entry = na
+
+// Reset pyramiding state when position closes
+if strategy.position_size == 0
+    pyramid_added_1r := false
+    pyramid_added_2r := false
+    pyramid_base_entry := na
+    pyramid_base_direction := na
+    pyramid_1r_entry := na
+    pyramid_2r_entry := na
+
+// Check pyramiding conditions
+// NOTE: Time filters do NOT apply to pyramiding - only to initial entries
+// Pyramiding only depends on: existing position, profit threshold, day, HTF trend, ATR regime
+
+// 1. Day: Tue/Thu (and Fri shorts)
+pyramiding_day_allowed = false
+if current_dow == 3  // Tuesday
+    pyramiding_day_allowed := true
+else if current_dow == 5  // Thursday
+    pyramiding_day_allowed := true
+else if current_dow == 6  // Friday
+    // Friday only for shorts
+    pyramiding_day_allowed := strategy.position_size < 0
+
+// 2. HTF EMA trend filter aligned (strong slope in trade direction)
+pyramiding_htf_allowed = false
+if use_htf_trend and use_htf_slope
+    if strategy.position_size > 0  // Long position
+        pyramiding_htf_allowed := htf_bullish and ema_slope_norm >= min_up_slope
+    else if strategy.position_size < 0  // Short position
+        pyramiding_htf_allowed := htf_bearish and ema_slope_norm <= min_down_slope
+else if use_htf_trend
+    // If HTF trend is enabled but slope filter is not, just check trend direction
+    if strategy.position_size > 0
+        pyramiding_htf_allowed := htf_bullish
+    else if strategy.position_size < 0
+        pyramiding_htf_allowed := htf_bearish
+else
+    // If HTF trend filter is not enabled, allow pyramiding
+    pyramiding_htf_allowed := true
+
+// 3. ATR regime is normal
+pyramiding_atr_allowed = not enable_pyramiding or atr_regime_normal
+
+// All pyramiding conditions (NO TIME CHECK - time only applies to initial entries)
+pyramiding_allowed = enable_pyramiding and pyramiding_day_allowed and pyramiding_htf_allowed and pyramiding_atr_allowed
+
+// Calculate open profit in R units
+float open_profit_r_long = na
+float open_profit_r_short = na
+if strategy.position_size > 0 and not na(strategy.position_avg_price)
+    entry_price = strategy.position_avg_price
+    current_price = close
+    profit_points = current_price - entry_price
+    open_profit_r_long := profit_points / sl_points  // Profit in R units
+    if na(pyramid_base_entry)
+        pyramid_base_entry := entry_price
+        pyramid_base_direction := "LONG"
+else if strategy.position_size < 0 and not na(strategy.position_avg_price)
+    entry_price = strategy.position_avg_price
+    current_price = close
+    profit_points = entry_price - current_price
+    open_profit_r_short := profit_points / sl_points  // Profit in R units
+    if na(pyramid_base_entry)
+        pyramid_base_entry := entry_price
+        pyramid_base_direction := "SHORT"
+
+// Get current position size (absolute value)
+current_position_size = math.abs(strategy.position_size)
+
+// Model 1: Add 1 unit at +1R, max 2 units total
+// Model 2: Add 1 unit at +1R, add 1 more at +2R, max 3 units total
+
+// LONG Pyramiding
+if enable_pyramiding and strategy.position_size > 0
+    open_profit_r = open_profit_r_long
+    entry_price = strategy.position_avg_price
+    
+    // Log pyramiding check for debugging
+    if not na(open_profit_r) and open_profit_r >= (pyramid_threshold_1r - 0.3)  // Log when getting close to threshold
+        log.info("  🔍 PYRAMIDING CHECK (LONG) | Profit: {0}R | Threshold: {1}R | Size: {2} | Day: {3} | HTF: {4} | ATR: {5} | Allowed: {6}", open_profit_r, pyramid_threshold_1r, current_position_size, current_dow, pyramiding_htf_allowed, atr_regime_normal, pyramiding_allowed)
+    
+    if pyramiding_allowed
+        if pyramiding_model == "Model 1"
+            // Model 1: Add at configurable threshold, max 2 units
+            if open_profit_r >= pyramid_threshold_1r and current_position_size < 2 and not pyramid_added_1r
+                pyramid_entry_price = close  // Entry at current price
+                strategy.entry("Long Pyramid 1R", strategy.long, qty=1)
+                pyramid_added_1r := true
+                pyramid_1r_entry := pyramid_entry_price
+                log.info("  📈 PYRAMID ADDED (LONG) | Model 1 | Base Entry: {0} | Pyramid Entry: {1} | Profit: {2}R | New Size: {3}", pyramid_base_entry, pyramid_entry_price, open_profit_r, current_position_size + 1)
+                
+                // Set SL/TP for pyramid entry (same as original)
+                pyramid_sl = pyramid_entry_price - sl_points
+                pyramid_tp = pyramid_entry_price + tp_points
+                strategy.exit("Long Pyramid 1R Exit", from_entry="Long Pyramid 1R", stop=pyramid_sl, limit=pyramid_tp, qty_percent=100)
+                
+                // Move original stop to breakeven (preserve TP)
+                if not na(pyramid_base_entry)
+                    breakeven_price = pyramid_base_entry + breakeven_buffer
+                    original_tp = pyramid_base_entry + tp_points
+                    strategy.exit("Long Exit", from_entry="Long", stop=breakeven_price, limit=original_tp, qty_percent=100)
+                    log.info("  🔄 STOP MOVED TO BREAKEVEN | Original Entry: {0} | Breakeven: {1} | TP: {2}", pyramid_base_entry, breakeven_price, original_tp)
+        
+        else if pyramiding_model == "Model 2"
+            // Model 2: Add at configurable thresholds, max 3 units
+            if open_profit_r >= pyramid_threshold_1r and current_position_size < 3 and not pyramid_added_1r
+                pyramid_entry_price = close  // Entry at current price
+                strategy.entry("Long Pyramid 1R", strategy.long, qty=1)
+                pyramid_added_1r := true
+                pyramid_1r_entry := pyramid_entry_price
+                log.info("  📈 PYRAMID ADDED (LONG) | Model 2 | Base Entry: {0} | Pyramid Entry: {1} | Profit: {2}R | New Size: {3}", pyramid_base_entry, pyramid_entry_price, open_profit_r, current_position_size + 1)
+                
+                // Set SL/TP for pyramid entry (same as original)
+                pyramid_sl = pyramid_entry_price - sl_points
+                pyramid_tp = pyramid_entry_price + tp_points
+                strategy.exit("Long Pyramid 1R Exit", from_entry="Long Pyramid 1R", stop=pyramid_sl, limit=pyramid_tp, qty_percent=100)
+                
+                // Move original stop to breakeven (preserve TP)
+                if not na(pyramid_base_entry)
+                    breakeven_price = pyramid_base_entry + breakeven_buffer
+                    original_tp = pyramid_base_entry + tp_points
+                    strategy.exit("Long Exit", from_entry="Long", stop=breakeven_price, limit=original_tp, qty_percent=100)
+                    log.info("  🔄 STOP MOVED TO BREAKEVEN | Original Entry: {0} | Breakeven: {1} | TP: {2}", pyramid_base_entry, breakeven_price, original_tp)
+            
+            else if open_profit_r >= pyramid_threshold_2r and current_position_size < 3 and not pyramid_added_2r
+                pyramid_entry_price = close  // Entry at current price
+                strategy.entry("Long Pyramid 2R", strategy.long, qty=1)
+                pyramid_added_2r := true
+                pyramid_2r_entry := pyramid_entry_price
+                log.info("  📈 PYRAMID ADDED (LONG) | Model 2 | Base Entry: {0} | Pyramid Entry: {1} | Profit: {2}R | New Size: {3}", pyramid_base_entry, pyramid_entry_price, open_profit_r, current_position_size + 1)
+                
+                // Set SL/TP for second pyramid entry
+                pyramid_sl = pyramid_entry_price - sl_points
+                pyramid_tp = pyramid_entry_price + tp_points
+                strategy.exit("Long Pyramid 2R Exit", from_entry="Long Pyramid 2R", stop=pyramid_sl, limit=pyramid_tp, qty_percent=100)
+                
+                // Move all stops to breakeven (idea-level, preserve TPs)
+                if not na(pyramid_base_entry)
+                    breakeven_price = pyramid_base_entry + breakeven_buffer
+                    original_tp = pyramid_base_entry + tp_points
+                    pyramid_1r_tp = not na(pyramid_1r_entry) ? pyramid_1r_entry + tp_points : original_tp
+                    // Move original position stop
+                    strategy.exit("Long Exit", from_entry="Long", stop=breakeven_price, limit=original_tp, qty_percent=100)
+                    // Move first pyramid stop
+                    strategy.exit("Long Pyramid 1R Exit", from_entry="Long Pyramid 1R", stop=breakeven_price, limit=pyramid_1r_tp, qty_percent=100)
+                    log.info("  🔄 ALL STOPS MOVED TO BREAKEVEN | Idea-Level: {0}", breakeven_price)
+
+// SHORT Pyramiding
+if enable_pyramiding and strategy.position_size < 0
+    open_profit_r = open_profit_r_short
+    entry_price = strategy.position_avg_price
+    
+    // Log pyramiding check for debugging
+    if not na(open_profit_r) and open_profit_r >= (pyramid_threshold_1r - 0.3)  // Log when getting close to threshold
+        log.info("  🔍 PYRAMIDING CHECK (SHORT) | Profit: {0}R | Threshold: {1}R | Size: {2} | Day: {3} | HTF: {4} | ATR: {5} | Allowed: {6}", open_profit_r, pyramid_threshold_1r, current_position_size, current_dow, pyramiding_htf_allowed, atr_regime_normal, pyramiding_allowed)
+    
+    if pyramiding_allowed
+        if pyramiding_model == "Model 1"
+            // Model 1: Add at configurable threshold, max 2 units
+            if open_profit_r >= pyramid_threshold_1r and current_position_size < 2 and not pyramid_added_1r
+                pyramid_entry_price = close  // Entry at current price
+                strategy.entry("Short Pyramid 1R", strategy.short, qty=1)
+                pyramid_added_1r := true
+                pyramid_1r_entry := pyramid_entry_price
+                log.info("  📉 PYRAMID ADDED (SHORT) | Model 1 | Base Entry: {0} | Pyramid Entry: {1} | Profit: {2}R | New Size: {3}", pyramid_base_entry, pyramid_entry_price, open_profit_r, current_position_size + 1)
+                
+                // Set SL/TP for pyramid entry (same as original)
+                pyramid_sl = pyramid_entry_price + sl_points
+                pyramid_tp = pyramid_entry_price - tp_points
+                strategy.exit("Short Pyramid 1R Exit", from_entry="Short Pyramid 1R", stop=pyramid_sl, limit=pyramid_tp, qty_percent=100)
+                
+                // Move original stop to breakeven (preserve TP)
+                if not na(pyramid_base_entry)
+                    breakeven_price = pyramid_base_entry - breakeven_buffer
+                    original_tp = pyramid_base_entry - tp_points
+                    strategy.exit("Short Exit", from_entry="Short", stop=breakeven_price, limit=original_tp, qty_percent=100)
+                    log.info("  🔄 STOP MOVED TO BREAKEVEN | Original Entry: {0} | Breakeven: {1} | TP: {2}", pyramid_base_entry, breakeven_price, original_tp)
+        
+        else if pyramiding_model == "Model 2"
+            // Model 2: Add at configurable thresholds, max 3 units
+            if open_profit_r >= pyramid_threshold_1r and current_position_size < 3 and not pyramid_added_1r
+                pyramid_entry_price = close  // Entry at current price
+                strategy.entry("Short Pyramid 1R", strategy.short, qty=1)
+                pyramid_added_1r := true
+                pyramid_1r_entry := pyramid_entry_price
+                log.info("  📉 PYRAMID ADDED (SHORT) | Model 2 | Base Entry: {0} | Pyramid Entry: {1} | Profit: {2}R | New Size: {3}", pyramid_base_entry, pyramid_entry_price, open_profit_r, current_position_size + 1)
+                
+                // Set SL/TP for pyramid entry (same as original)
+                pyramid_sl = pyramid_entry_price + sl_points
+                pyramid_tp = pyramid_entry_price - tp_points
+                strategy.exit("Short Pyramid 1R Exit", from_entry="Short Pyramid 1R", stop=pyramid_sl, limit=pyramid_tp, qty_percent=100)
+                
+                // Move original stop to breakeven (preserve TP)
+                if not na(pyramid_base_entry)
+                    breakeven_price = pyramid_base_entry - breakeven_buffer
+                    original_tp = pyramid_base_entry - tp_points
+                    strategy.exit("Short Exit", from_entry="Short", stop=breakeven_price, limit=original_tp, qty_percent=100)
+                    log.info("  🔄 STOP MOVED TO BREAKEVEN | Original Entry: {0} | Breakeven: {1} | TP: {2}", pyramid_base_entry, breakeven_price, original_tp)
+            
+            else if open_profit_r >= pyramid_threshold_2r and current_position_size < 3 and not pyramid_added_2r
+                pyramid_entry_price = close  // Entry at current price
+                strategy.entry("Short Pyramid 2R", strategy.short, qty=1)
+                pyramid_added_2r := true
+                pyramid_2r_entry := pyramid_entry_price
+                log.info("  📉 PYRAMID ADDED (SHORT) | Model 2 | Base Entry: {0} | Pyramid Entry: {1} | Profit: {2}R | New Size: {3}", pyramid_base_entry, pyramid_entry_price, open_profit_r, current_position_size + 1)
+                
+                // Set SL/TP for second pyramid entry
+                pyramid_sl = pyramid_entry_price + sl_points
+                pyramid_tp = pyramid_entry_price - tp_points
+                strategy.exit("Short Pyramid 2R Exit", from_entry="Short Pyramid 2R", stop=pyramid_sl, limit=pyramid_tp, qty_percent=100)
+                
+                // Move all stops to breakeven (idea-level, preserve TPs)
+                if not na(pyramid_base_entry)
+                    breakeven_price = pyramid_base_entry - breakeven_buffer
+                    original_tp = pyramid_base_entry - tp_points
+                    pyramid_1r_tp = not na(pyramid_1r_entry) ? pyramid_1r_entry - tp_points : original_tp
+                    // Move original position stop
+                    strategy.exit("Short Exit", from_entry="Short", stop=breakeven_price, limit=original_tp, qty_percent=100)
+                    // Move first pyramid stop
+                    strategy.exit("Short Pyramid 1R Exit", from_entry="Short Pyramid 1R", stop=breakeven_price, limit=pyramid_1r_tp, qty_percent=100)
+                    log.info("  🔄 ALL STOPS MOVED TO BREAKEVEN | Idea-Level: {0}", breakeven_price)
+
+//=============================================================================
+// SET SL/TP AFTER POSITION OPENS (KEY FIX!)
+//=============================================================================
+// NOTE: This exit logic works independently of pyramiding.
+// When pyramiding is disabled, this logic works exactly as before.
+// Pyramiding only modifies stops when enabled and conditions are met.
+// Track if we've already set exits for current position (prevent overwriting)
+var bool exits_set_long = false
+var bool exits_set_short = false
+
+// Detect when position just opened
+long_opened = strategy.position_size > 0 and strategy.position_size[1] == 0
+short_opened = strategy.position_size < 0 and strategy.position_size[1] == 0
+
+// Reset flags when position closes
+if strategy.position_size == 0
+    exits_set_long := false
+    exits_set_short := false
+
+// Get ACTUAL entry price from strategy (only when position exists)
+entry_long = strategy.position_size > 0 ? strategy.position_avg_price : na
+entry_short = strategy.position_size < 0 ? strategy.position_avg_price : na
+
+// Set exits using PRICE levels (not currency amounts!)
+// CRITICAL: Set exit immediately when position opens, using actual fill price
+if long_opened and not exits_set_long
+    entry = strategy.position_avg_price
+    
+    // Validate entry price is valid
+    if not na(entry) and entry > 0
+        sl = entry - sl_points
+        tp = entry + tp_points
+        
+        // Validate SL/TP are reasonable (SL below entry, TP above entry)
+        if sl < entry and tp > entry
+            // Use from_entry to ensure it's tied to the correct entry
+            // qty_percent=100 ensures entire position is closed
+            strategy.exit("Long Exit", from_entry="Long", stop=sl, limit=tp, qty_percent=100)
+            exits_set_long := true
+            
+            // Log for debugging
+            log.info("🔵 LONG EXIT SET | Entry: {0} | SL: {1} ({2} pts = ${3}) | TP: {4} ({5} pts = ${6})", entry, sl, sl_points, sl_points * syminfo.pointvalue, tp, tp_points, tp_points * syminfo.pointvalue)
+            label.new(bar_index, low, "E:" + str.tostring(entry, "#.##") + "\nSL:" + str.tostring(sl, "#.##") + "\nTP:" + str.tostring(tp, "#.##"), style=label.style_label_up, color=color.blue, textcolor=color.white, size=size.tiny)
+        else
+            log.error("❌ LONG EXIT INVALID | Entry: {0} | SL: {1} | TP: {2} | Check SL/TP values!", entry, sl, tp)
+    else
+        log.error("❌ LONG ENTRY INVALID | Entry: {0}", entry)
+
+if short_opened and not exits_set_short
+    entry = strategy.position_avg_price
+    
+    // Validate entry price is valid
+    if not na(entry) and entry > 0
+        sl = entry + sl_points
+        tp = entry - tp_points
+        
+        // Validate SL/TP are reasonable (SL above entry, TP below entry)
+        if sl > entry and tp < entry
+            // Use from_entry to ensure it's tied to the correct entry
+            // qty_percent=100 ensures entire position is closed
+            strategy.exit("Short Exit", from_entry="Short", stop=sl, limit=tp, qty_percent=100)
+            exits_set_short := true
+            
+            // Log for debugging
+            log.info("🔴 SHORT EXIT SET | Entry: {0} | SL: {1} ({2} pts = ${3}) | TP: {4} ({5} pts = ${6})", entry, sl, sl_points, sl_points * syminfo.pointvalue, tp, tp_points, tp_points * syminfo.pointvalue)
+            label.new(bar_index, high, "E:" + str.tostring(entry, "#.##") + "\nSL:" + str.tostring(sl, "#.##") + "\nTP:" + str.tostring(tp, "#.##"), style=label.style_label_down, color=color.purple, textcolor=color.white, size=size.tiny)
+        else
+            log.error("❌ SHORT EXIT INVALID | Entry: {0} | SL: {1} | TP: {2} | Check SL/TP values!", entry, sl, tp)
+    else
+        log.error("❌ SHORT ENTRY INVALID | Entry: {0}", entry)
+
+// Also set exits on every bar if position exists but exits not set (safety net)
+if strategy.position_size > 0 and not exits_set_long and not na(entry_long)
+    entry = entry_long
+    sl = entry - sl_points
+    tp = entry + tp_points
+    if sl < entry and tp > entry
+        strategy.exit("Long Exit", from_entry="Long", stop=sl, limit=tp, qty_percent=100)
+        exits_set_long := true
+        log.warning("⚠️ LONG EXIT SET (safety net) | Entry: {0} | SL: {1} | TP: {2}", entry, sl, tp)
+
+if strategy.position_size < 0 and not exits_set_short and not na(entry_short)
+    entry = entry_short
+    sl = entry + sl_points
+    tp = entry - tp_points
+    if sl > entry and tp < entry
+        strategy.exit("Short Exit", from_entry="Short", stop=sl, limit=tp, qty_percent=100)
+        exits_set_short := true
+        log.warning("⚠️ SHORT EXIT SET (safety net) | Entry: {0} | SL: {1} | TP: {2}", entry, sl, tp)
+
+//=============================================================================
+// TRADE EXIT LOGGING
+//=============================================================================
+// Detect when position closes
+long_closed = strategy.position_size[1] > 0 and strategy.position_size == 0
+short_closed = strategy.position_size[1] < 0 and strategy.position_size == 0
+
+if long_closed
+    entry_price = strategy.closedtrades.entry_price(strategy.closedtrades - 1)
+    exit_price = strategy.closedtrades.exit_price(strategy.closedtrades - 1)
+    profit = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    expected_sl = entry_price - sl_points
+    expected_tp = entry_price + tp_points
+    
+    // Check for slippage (exit worse than expected SL)
+    slippage_points = exit_price < expected_sl ? expected_sl - exit_price : 0
+    slippage_dollars = slippage_points * syminfo.pointvalue
+    
+    exit_reason = exit_price <= expected_sl ? "STOP LOSS" : exit_price >= expected_tp ? "TAKE PROFIT" : "OTHER"
+    
+    if slippage_points > 0
+        log.error("⚠️ LONG SLIPPAGE DETECTED! | Entry: {0} | Exit: {1} | Expected SL: {2} | Slippage: {3} pts (${4}) | P&L: {5}", entry_price, exit_price, expected_sl, slippage_points, slippage_dollars, profit)
+    else
+        log.info("🔵 LONG CLOSED | Entry: {0} | Exit: {1} | P&L: {2} | Reason: {3} | Expected SL: {4} | Expected TP: {5}", entry_price, exit_price, profit, exit_reason, expected_sl, expected_tp)
+
+if short_closed
+    entry_price = strategy.closedtrades.entry_price(strategy.closedtrades - 1)
+    exit_price = strategy.closedtrades.exit_price(strategy.closedtrades - 1)
+    profit = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    expected_sl = entry_price + sl_points
+    expected_tp = entry_price - tp_points
+    
+    // Check for slippage (exit worse than expected SL)
+    slippage_points = exit_price > expected_sl ? exit_price - expected_sl : 0
+    slippage_dollars = slippage_points * syminfo.pointvalue
+    
+    exit_reason = exit_price >= expected_sl ? "STOP LOSS" : exit_price <= expected_tp ? "TAKE PROFIT" : "OTHER"
+    
+    if slippage_points > 0
+        log.error("⚠️ SHORT SLIPPAGE DETECTED! | Entry: {0} | Exit: {1} | Expected SL: {2} | Slippage: {3} pts (${4}) | P&L: {5}", entry_price, exit_price, expected_sl, slippage_points, slippage_dollars, profit)
+    else
+        log.info("🔴 SHORT CLOSED | Entry: {0} | Exit: {1} | P&L: {2} | Reason: {3} | Expected SL: {4} | Expected TP: {5}", entry_price, exit_price, profit, exit_reason, expected_sl, expected_tp)
+
+//=============================================================================
+// VISUAL
+//=============================================================================
+bgcolor(strategy.position_size > 0 ? color.new(color.green, 95) : strategy.position_size < 0 ? color.new(color.red, 95) : na)
+plot(strategy.position_size, "Position", display=display.status_line)
+
+// Plot HTF EMA and HTF Close if enabled (for visual reference)
+plot(use_htf_trend ? htf_ema : na, "HTF EMA", color=color.new(color.blue, 30), linewidth=2, display=display.all)
+plot(use_htf_trend ? htf_close : na, "HTF Close", color=color.new(color.orange, 50), linewidth=1, display=display.all, style=plot.style_circles)
+
+//=============================================================================
+// STATUS TABLE (shows current filter settings)
+//=============================================================================
+// Determine if any trend filter is active
+any_trend_filter = use_htf_trend or use_ema_filter or use_adx_filter or use_structure_filter
+table_rows = show_trend_filters and any_trend_filter ? 12 : 5
+
+var table status_table = table.new(position.top_right, 2, table_rows, bgcolor=color.new(color.black, 80), border_width=1)
+
+if barstate.islast
+    // Mode
+    table.cell(status_table, 0, 0, "Time Mode:", text_color=color.white, text_size=size.small)
+    table.cell(status_table, 1, 0, time_filter_mode, text_color=color.yellow, text_size=size.small)
+    
+    // Current NY hour
+    table.cell(status_table, 0, 1, "Current NY Hour:", text_color=color.white, text_size=size.small)
+    table.cell(status_table, 1, 1, str.tostring(current_hour_ny) + ":" + str.tostring(current_min_ny, "00"), text_color=color.aqua, text_size=size.small)
+    
+    // Slot allowed (for Specific Hours mode)
+    if time_filter_mode == "Specific Hours"
+        table.cell(status_table, 0, 2, "Slot Allowed:", text_color=color.white, text_size=size.small)
+        table.cell(status_table, 1, 2, slot_allowed ? "✅ YES" : "❌ NO", text_color=slot_allowed ? color.lime : color.red, text_size=size.small)
+    
+    // Day allowed (with direction)
+    table.cell(status_table, 0, 3, "Day Allowed:", text_color=color.white, text_size=size.small)
+    day_status_str = (day_allows_long ? "▲" : "") + (day_allows_short ? "▼" : "")
+    if day_status_str == ""
+        day_status_str := "❌ NO"
+    else
+        day_status_str := "✅ " + day_status_str + " (" + current_day_setting + ")"
+    table.cell(status_table, 1, 3, day_status_str, text_color=day_allowed ? color.lime : color.red, text_size=size.small)
+    
+    // Overall time
+    table.cell(status_table, 0, 4, "Time OK:", text_color=color.white, text_size=size.small)
+    table.cell(status_table, 1, 4, in_trading_window ? "✅ YES" : "❌ NO", text_color=in_trading_window ? color.lime : color.red, text_size=size.small)
+    
+    // Trend Filters (if enabled and show is on)
+    if show_trend_filters and any_trend_filter
+        // Separator
+        table.cell(status_table, 0, 5, "── TREND ──", text_color=color.gray, text_size=size.small)
+        table.cell(status_table, 1, 5, "L / S", text_color=color.gray, text_size=size.small)
+        
+        // HTF Trend
+        if use_htf_trend
+            htf_status = (htf_allows_long ? "✅" : "❌") + " / " + (htf_allows_short ? "✅" : "❌")
+            table.cell(status_table, 0, 6, "HTF (" + htf_timeframe + "):", text_color=color.white, text_size=size.small)
+            table.cell(status_table, 1, 6, htf_status, text_color=color.aqua, text_size=size.small)
+        
+        // EMA Filter
+        if use_ema_filter
+            ema_status = (ema_allows_long ? "✅" : "❌") + " / " + (ema_allows_short ? "✅" : "❌")
+            table.cell(status_table, 0, 7, "EMA (" + str.tostring(ema_length) + "):", text_color=color.white, text_size=size.small)
+            table.cell(status_table, 1, 7, ema_status, text_color=color.orange, text_size=size.small)
+        
+        // ADX Filter
+        if use_adx_filter
+            adx_status = (adx_allows_long ? "✅" : "❌") + " / " + (adx_allows_short ? "✅" : "❌")
+            table.cell(status_table, 0, 8, "ADX (" + str.tostring(adx_value, "#") + "):", text_color=color.white, text_size=size.small)
+            table.cell(status_table, 1, 8, adx_status, text_color=color.purple, text_size=size.small)
+        
+        // Structure Filter
+        if use_structure_filter
+            struct_status = (structure_allows_long ? "✅" : "❌") + " / " + (structure_allows_short ? "✅" : "❌")
+            table.cell(status_table, 0, 9, "Structure:", text_color=color.white, text_size=size.small)
+            table.cell(status_table, 1, 9, struct_status, text_color=color.yellow, text_size=size.small)
+        
+        // Combined Trend
+        trend_status = (trend_allows_long ? "✅" : "❌") + " / " + (trend_allows_short ? "✅" : "❌")
+        table.cell(status_table, 0, 10, "TREND OK:", text_color=color.white, text_size=size.small)
+        table.cell(status_table, 1, 10, trend_status, text_color=trend_allows_long or trend_allows_short ? color.lime : color.red, text_size=size.small)
+        
+        // HTF EMA value for reference
+        if use_htf_trend
+            table.cell(status_table, 0, 11, "HTF EMA:", text_color=color.gray, text_size=size.tiny)
+            table.cell(status_table, 1, 11, str.tostring(htf_ema, "#.##"), text_color=color.gray, text_size=size.tiny)
+
+//=============================================================================
+// SETTINGS TABLE (shows all strategy settings)
+//=============================================================================
+// Use fixed large number of rows (will only use what's needed)
+var table settings_table = table.new(position.bottom_left, 2, 20, bgcolor=settings_bg_color, border_width=1, frame_color=color.new(color.gray, 50), frame_width=2)
+
+if barstate.islast and show_settings_table
+    row = 0
+    
+    // Header
+    table.cell(settings_table, 0, row, "═══════ STRATEGY SETTINGS ═══════", text_color=settings_header_color, text_size=size.normal, bgcolor=settings_bg_header)
+    table.cell(settings_table, 1, row, "", text_color=settings_header_color, text_size=size.normal, bgcolor=settings_bg_header)
+    row += 1
+    
+    // Core Settings
+    table.cell(settings_table, 0, row, "Signal Preference:", text_color=settings_label_color, text_size=size.small)
+    table.cell(settings_table, 1, row, signal_pref, text_color=settings_value_color, text_size=size.small)
+    row += 1
+    
+    table.cell(settings_table, 0, row, "ATR Multiplier:", text_color=settings_label_color, text_size=size.small)
+    table.cell(settings_table, 1, row, str.tostring(atr_multi), text_color=settings_value_color, text_size=size.small)
+    row += 1
+    
+    table.cell(settings_table, 0, row, "Stop Loss:", text_color=settings_label_color, text_size=size.small)
+    table.cell(settings_table, 1, row, str.tostring(sl_points) + " pts ($" + str.tostring(sl_points * syminfo.pointvalue, "#,###") + ")", text_color=settings_sl_color, text_size=size.small)
+    row += 1
+    
+    table.cell(settings_table, 0, row, "Take Profit:", text_color=settings_label_color, text_size=size.small)
+    table.cell(settings_table, 1, row, str.tostring(tp_points) + " pts ($" + str.tostring(tp_points * syminfo.pointvalue, "#,###") + ")", text_color=settings_tp_color, text_size=size.small)
+    row += 1
+    
+    table.cell(settings_table, 0, row, "Global Direction:", text_color=settings_label_color, text_size=size.small)
+    global_dir_text = trade_dir == "Disabled" ? trade_dir + " (Using Day-Specific)" : trade_dir + " (Day-Specific Overrides)"
+    table.cell(settings_table, 1, row, global_dir_text, text_color=settings_value_color, text_size=size.small)
+    row += 1
+    
+    // Entry Filters
+    if use_candle_color_filter
+        table.cell(settings_table, 0, row, "Candle Color Filter:", text_color=settings_label_color, text_size=size.small)
+        table.cell(settings_table, 1, row, "Mode: " + candle_color_mode + " | Green=Long, Red=Short", text_color=color.purple, text_size=size.small)
+        row += 1
+    
+    // SMT Divergence Filter
+    if use_smt_filter
+        table.cell(settings_table, 0, row, "SMT Divergence:", text_color=settings_label_color, text_size=size.small)
+        smt_status = (smt_allows_long ? "✅" : "❌") + " / " + (smt_allows_short ? "✅" : "❌")
+        smt_info = smt_reference + " | " + smt_timeframe + " | " + smt_correlation + " | Swing:" + str.tostring(smt_swing_len)
+        if smt_require_range
+            smt_info := smt_info + " | Range:ON"
+        table.cell(settings_table, 1, row, smt_status + " | " + smt_info, text_color=color.fuchsia, text_size=size.small)
+        row += 1
+    
+    // Phase 1 Quality Filters
+    if use_fvg_quality or use_htf_slope
+        table.cell(settings_table, 0, row, "─── PHASE 1 FILTERS ───", text_color=settings_section_color, text_size=size.small, bgcolor=settings_bg_section)
+        table.cell(settings_table, 1, row, "", text_color=settings_section_color, text_size=size.small, bgcolor=settings_bg_section)
+        row += 1
+        
+        if use_fvg_quality
+            table.cell(settings_table, 0, row, "IFVG Quality:", text_color=settings_label_color, text_size=size.small)
+            string quality_str = ""
+            if fvg_quality_mode == "Filter Extremes"
+                quality_str := "Mode:" + fvg_quality_mode + " | ATR:" + str.tostring(atr_len) + " | Extreme Min:" + str.tostring(fvg_extreme_min) + " | Extreme Max:" + str.tostring(fvg_extreme_max)
+            else
+                quality_str := "Mode:" + fvg_quality_mode + " | ATR:" + str.tostring(atr_len) + " | Min:" + str.tostring(fvg_min_atr) + " | Max:" + str.tostring(fvg_max_atr)
+            table.cell(settings_table, 1, row, quality_str, text_color=color.orange, text_size=size.small)
+            row += 1
+        
+        if use_htf_slope
+            table.cell(settings_table, 0, row, "HTF Slope:", text_color=settings_label_color, text_size=size.small)
+            string slope_str = "ATR:" + str.tostring(htf_atr_len) + " | Up:" + str.tostring(min_up_slope) + " | Down:" + str.tostring(min_down_slope)
+            table.cell(settings_table, 1, row, slope_str, text_color=color.blue, text_size=size.small)
+            row += 1
+    
+    // Time Filter Settings
+    table.cell(settings_table, 0, row, "─── TIME FILTER ───", text_color=settings_section_color, text_size=size.small, bgcolor=settings_bg_section)
+    table.cell(settings_table, 1, row, "", text_color=settings_section_color, text_size=size.small, bgcolor=settings_bg_section)
+    row += 1
+    
+    table.cell(settings_table, 0, row, "Time Mode:", text_color=settings_label_color, text_size=size.small)
+    table.cell(settings_table, 1, row, time_filter_mode, text_color=settings_value_color, text_size=size.small)
+    row += 1
+    
+    if time_filter_mode == "Custom Time"
+        table.cell(settings_table, 0, row, "Time Range:", text_color=settings_label_color, text_size=size.small)
+        table.cell(settings_table, 1, row, str.tostring(start_hour, "00") + ":" + str.tostring(start_min, "00") + " - " + str.tostring(end_hour, "00") + ":" + str.tostring(end_min, "00"), text_color=settings_value_color, text_size=size.small)
+        row += 1
+    else if time_filter_mode == "ICT Killzones"
+        table.cell(settings_table, 0, row, "ICT Killzone:", text_color=settings_label_color, text_size=size.small)
+        table.cell(settings_table, 1, row, ict_killzone, text_color=settings_value_color, text_size=size.small)
+        row += 1
+    
+    // Days of Week with Direction
+    string days_str = ""
+    if trade_monday != "Disabled"
+        days_str := days_str + "Mon" + get_day_symbol(trade_monday) + " "
+    if trade_tuesday != "Disabled"
+        days_str := days_str + "Tue" + get_day_symbol(trade_tuesday) + " "
+    if trade_wednesday != "Disabled"
+        days_str := days_str + "Wed" + get_day_symbol(trade_wednesday) + " "
+    if trade_thursday != "Disabled"
+        days_str := days_str + "Thu" + get_day_symbol(trade_thursday) + " "
+    if trade_friday != "Disabled"
+        days_str := days_str + "Fri" + get_day_symbol(trade_friday) + " "
+    if trade_saturday != "Disabled"
+        days_str := days_str + "Sat" + get_day_symbol(trade_saturday) + " "
+    if trade_sunday != "Disabled"
+        days_str := days_str + "Sun" + get_day_symbol(trade_sunday) + " "
+    if days_str == ""
+        days_str := "None"
+    
+    table.cell(settings_table, 0, row, "Trading Days:", text_color=settings_label_color, text_size=size.small)
+    table.cell(settings_table, 1, row, days_str + " (↕=Both ▲=Long ▼=Short)", text_color=settings_value_color, text_size=size.small)
+    row += 1
+    
+    // Trend Filters
+    if use_htf_trend or use_ema_filter or use_adx_filter or use_structure_filter
+        table.cell(settings_table, 0, row, "─── TREND FILTERS ───", text_color=settings_section_color, text_size=size.small, bgcolor=settings_bg_section)
+        table.cell(settings_table, 1, row, "", text_color=settings_section_color, text_size=size.small, bgcolor=settings_bg_section)
+        row += 1
+        
+        if use_htf_trend
+            table.cell(settings_table, 0, row, "HTF Trend:", text_color=settings_label_color, text_size=size.small)
+            table.cell(settings_table, 1, row, htf_timeframe + " | " + str.tostring(htf_ema_len) + " EMA | " + htf_trend_mode, text_color=settings_htf_color, text_size=size.small)
+            row += 1
+        
+        if use_ema_filter
+            table.cell(settings_table, 0, row, "EMA Filter:", text_color=settings_label_color, text_size=size.small)
+            table.cell(settings_table, 1, row, str.tostring(ema_length) + " EMA | " + ema_mode, text_color=settings_ema_color, text_size=size.small)
+            row += 1
+        
+        if use_adx_filter
+            table.cell(settings_table, 0, row, "ADX Filter:", text_color=settings_label_color, text_size=size.small)
+            string adx_di_str = adx_di_filter ? " | DI" : ""
+            table.cell(settings_table, 1, row, str.tostring(adx_length) + " | Min: " + str.tostring(adx_threshold) + adx_di_str, text_color=settings_adx_color, text_size=size.small)
+            row += 1
+        
+        if use_structure_filter
+            table.cell(settings_table, 0, row, "Structure Filter:", text_color=settings_label_color, text_size=size.small)
+            table.cell(settings_table, 1, row, "Lookback: " + str.tostring(structure_lookback) + " | Swing: " + str.tostring(structure_swing_len), text_color=settings_structure_color, text_size=size.small)
+            row += 1

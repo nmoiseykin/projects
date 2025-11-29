@@ -1,0 +1,800 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// ©LuxAlgo
+// Converted to Backtesting Strategy
+
+//@version=6
+strategy("IFVG Backtest Strategy [BacktestX]", "IFVG-BT", overlay = true, 
+     max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, 
+     initial_capital = 1000000, default_qty_type = strategy.fixed, default_qty_value = 1, 
+     commission_type = strategy.commission.percent, commission_value = 0.1, 
+     pyramiding = 1, 
+     process_orders_on_close = false,  // false = Next Bar Open (safer), true = Same Bar Close (may cause immediate stop-outs)
+     calc_on_every_tick = false)
+
+//---------------------------------------------------------------------------------------------------------------------}
+//Settings
+//---------------------------------------------------------------------------------------------------------------------{
+// Basic Settings
+signal_pref = input.string("Close", title = "Signal Preference", options = ["Close","Wick"], tooltip = "Choose to send signals based on Wicks or Close Price.")
+wt = signal_pref == "Wick"
+atr_multi = input.float(0.25, step = 0.25, minval = 0, title = "ATR Multiplier", tooltip = "Filters FVGs based on ATR Width, Only displays Inversions that are Greater-Than the ATR*Multiplier.")
+disp_num = input.int(5, maxval = 100, minval = 1, title = "Show Last FVGs", tooltip = "Specifies the amount of most recent inversion FVG to display.")
+
+// Direction Filter
+direction_filter = input.string("Both", title = "Direction Filter", options = ["Both", "Bullish Only", "Bearish Only"], tooltip = "Filter trades by direction.")
+
+// Entry Timing
+entry_timing = input.string("Next Bar Open", title = "Entry Timing", options = ["Same Bar Close", "Next Bar Open"], 
+     tooltip = "Same Bar Close: Enter immediately at signal bar close (risky - may cause immediate stop-outs). Next Bar Open: Wait for next bar to open (safer - gives breathing room).")
+
+// Time of Day Filter
+time_filter_type = input.string("Disabled", title = "Time Filter", options = ["Disabled", "ICT Killzones", "Custom"], tooltip = "Filter trades by time of day.")
+ict_killzone = input.string("London Killzone", title = "ICT Killzone", options = ["London Killzone", "New York Killzone", "Asian Killzone", "London Close"], tooltip = "Select ICT killzone time window.", group = "Time Filter")
+custom_start_hour = input.int(9, minval = 0, maxval = 23, title = "Start Hour", tooltip = "Start hour for custom time filter (0-23).", group = "Time Filter")
+custom_start_min = input.int(30, minval = 0, maxval = 59, title = "Start Minute", tooltip = "Start minute for custom time filter (0-59).", group = "Time Filter")
+custom_end_hour = input.int(16, minval = 0, maxval = 23, title = "End Hour", tooltip = "End hour for custom time filter (0-23).", group = "Time Filter")
+custom_end_min = input.int(0, minval = 0, maxval = 59, title = "End Minute", tooltip = "End minute for custom time filter (0-59).", group = "Time Filter")
+timezone_input = input.string("Exchange", title = "Timezone", options = ["Exchange", "UTC"], tooltip = "Timezone for time filter.", group = "Time Filter")
+
+// IFVG Timeframe
+ifvg_timeframe = input.string("CHART", title = "IFVG Timeframe", options = ["CHART", "1", "3", "5", "15", "30", "60", "240", "D", "W"], tooltip = "Timeframe for IFVG detection. CHART uses current chart timeframe.")
+use_custom_tf = ifvg_timeframe != "CHART"
+tf = use_custom_tf ? (ifvg_timeframe == "D" ? "1D" : ifvg_timeframe == "W" ? "1W" : ifvg_timeframe) : timeframe.period
+
+// Stop Loss & Take Profit
+sl_type = input.string("Static (Fixed Points)", title = "Stop Loss Type", options = ["Dynamic (FVG-based)", "Static (Fixed Points)"], group = "Exit Settings")
+sl_points = input.float(40.0, minval = 0, step = 0.1, title = "SL Points (Dynamic: below/above FVG, Static: from entry)", group = "Exit Settings")
+tp_type = input.string("Static (Fixed Points)", title = "Take Profit Type", options = ["Dynamic (RR-based)", "Static (Fixed Points)"], group = "Exit Settings")
+tp_value = input.float(80.0, minval = 0, step = 0.1, title = "TP Value (Dynamic: RR Multiplier, Static: Fixed Points)", tooltip = "Dynamic: TP = (SL Points + FVG Size) × Multiplier | Static: TP = Fixed Points from entry", group = "Exit Settings")
+
+// Position Sizing
+contracts = input.int(1, minval = 1, title = "Contracts", tooltip = "Number of contracts per trade.")
+
+// Date Range Filter
+use_date_filter = input.bool(true, title = "Use Date Range Filter", group = "Date Range", tooltip = "Enable to limit backtesting to a specific date range.")
+start_date = input.time(timestamp("17 Nov 2025 00:00 +0000"), title = "Start Date", group = "Date Range", tooltip = "Backtest start date (default: 7 days ago)")
+end_date = input.time(timestamp("24 Nov 2025 23:59 +0000"), title = "End Date", group = "Date Range", tooltip = "Backtest end date (default: today)")
+
+// Check if current bar is within date range
+in_date_range = use_date_filter ? (time >= start_date and time <= end_date) : true
+
+// Pending SL/TP buffers so we can anchor exits to actual fills
+var float pending_long_sl_points = na
+var float pending_long_tp_points = na
+var float pending_long_sl_price = na
+var float pending_long_tp_price = na
+var bool pending_long_sl_is_static = false
+var bool pending_long_tp_is_static = false
+
+var float pending_short_sl_points = na
+var float pending_short_tp_points = na
+var float pending_short_sl_price = na
+var float pending_short_tp_price = na
+var bool pending_short_sl_is_static = false
+var bool pending_short_tp_is_static = false
+
+// Active exit levels once the trade is live
+var float active_long_sl_price = na
+var float active_long_tp_price = na
+var float active_short_sl_price = na
+var float active_short_tp_price = na
+
+// Display Options
+show_debug_labels = input.bool(false, title = "Show Debug Labels", tooltip = "Show detailed debug labels on chart. Disable for cleaner view with only TradingView's built-in trade markers.", group = "Display")
+show_all_signals = input.bool(true, title = "Show All IFVG Signals", tooltip = "If enabled, shows all IFVG retest signals (even filtered ones). If disabled, only shows signals that result in actual trades.", group = "Display")
+
+// Colors
+green = input.color(color.new(#089981, 80), title = "Bull Color", group = "Colors")
+red = input.color(color.new(#f23645, 80), title = "Bear Color", group = "Colors")
+gray = input.color(#787b86, title = "Midline Color", group = "Colors")
+invis = color.rgb(0,0,0,100)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Validation and Initial Logging
+//---------------------------------------------------------------------------------------------------------------------{
+// Validate entry timing matches code setting
+// NOTE: To use "Same Bar Close", you MUST change line 11: process_orders_on_close = false → true
+if barstate.isfirst and entry_timing == "Same Bar Close"
+    runtime.error("❌ ENTRY TIMING MISMATCH: You selected 'Same Bar Close' but code is set to 'Next Bar Open'. To fix: Change line 11 to 'process_orders_on_close = true'")
+
+if barstate.isfirst and entry_timing == "Next Bar Open"
+    log.info("✅ Entry Timing: Next Bar Open (process_orders_on_close = false)")
+
+// Display date range info
+if barstate.isfirst and use_date_filter
+    log.info("📅 Date Range Filter: ACTIVE")
+    log.info("  └─ Start: {0}", str.format_time(start_date, "yyyy-MM-dd HH:mm", "America/New_York"))
+    log.info("  └─ End: {0}", str.format_time(end_date, "yyyy-MM-dd HH:mm", "America/New_York"))
+    log.info("  └─ Duration: 7 days (default)")
+
+//---------------------------------------------------------------------------------------------------------------------}
+//UDT's
+//---------------------------------------------------------------------------------------------------------------------{
+type lab //Contains Necessary Label Data to Send to Label Function
+    int x
+    float y
+    int dir
+
+type fvg //Contains Necessary FVG Data to Send to Chart.
+    int left = na
+    float top = na
+    int right = na
+    float bot = na
+    float mid = na
+    int dir = na
+    int state = na
+    array<lab> labs = na
+    int x_val = na
+
+//---------------------------------------------------------------------------------------------------------------------}
+//Functions
+//---------------------------------------------------------------------------------------------------------------------{
+//Basic Calcs
+buffer = 100 //How many FVGs to keep in memory.
+
+// Get price data from appropriate timeframe
+get_price_data() =>
+    if use_custom_tf
+        [request.security(syminfo.tickerid, tf, low, lookahead = barmerge.lookahead_off),
+         request.security(syminfo.tickerid, tf, high, lookahead = barmerge.lookahead_off),
+         request.security(syminfo.tickerid, tf, open, lookahead = barmerge.lookahead_off),
+         request.security(syminfo.tickerid, tf, close, lookahead = barmerge.lookahead_off),
+         request.security(syminfo.tickerid, tf, time, lookahead = barmerge.lookahead_off)]
+    else
+        [low, high, open, close, time]
+
+[low_tf, high_tf, open_tf, close_tf, time_tf] = get_price_data()
+
+// Get historical price data for FVG detection
+get_historical_data() =>
+    if use_custom_tf
+        [request.security(syminfo.tickerid, tf, low[1], lookahead = barmerge.lookahead_off),
+         request.security(syminfo.tickerid, tf, high[1], lookahead = barmerge.lookahead_off),
+         request.security(syminfo.tickerid, tf, close[1], lookahead = barmerge.lookahead_off),
+         request.security(syminfo.tickerid, tf, low[2], lookahead = barmerge.lookahead_off),
+         request.security(syminfo.tickerid, tf, high[2], lookahead = barmerge.lookahead_off),
+         request.security(syminfo.tickerid, tf, time[1], lookahead = barmerge.lookahead_off)]
+    else
+        [low[1], high[1], close[1], low[2], high[2], time[1]]
+
+[low_tf_1, high_tf_1, close_tf_1, low_tf_2, high_tf_2, time_tf_1] = get_historical_data()
+
+c_top = math.max(open_tf, close_tf)
+c_bot = math.min(open_tf, close_tf)
+
+label_maker(_x,_y,_dir) => //Used for making Labels
+    switch
+        _dir == 1 => label.new(_x,_y,"\n▲", style = label.style_text_outline, color = invis,  textcolor = color.new(green,0), size = size.small, xloc = xloc.bar_time)
+        _dir == -1 => label.new(_x,_y, "▼\n", style = label.style_text_outline, color = invis,  textcolor = color.new(red,0), size = size.small, xloc = xloc.bar_time)
+
+fvg_manage(_ary,_inv_ary) => //First step filtering of FVG data, Not all FVGs will be displayed, only inversions.
+    if _ary.size() >= buffer
+        _ary.shift()
+
+    if _ary.size() > 0
+        for i = _ary.size()-1 to 0
+            value = _ary.get(i)
+            _dir = value.dir
+
+            if _dir == 1 and (c_bot < value.bot)
+                log.info("🔄 BULLISH FVG INVERTED → Now BEARISH IFVG")
+                log.info("  └─ Time: {0}", str.format_time(time_tf, "yyyy-MM-dd HH:mm", "America/New_York"))
+                log.info("  └─ Bar: {0} | Close: {1}", bar_index, close_tf)
+                log.info("  └─ IFVG Zone: [{0} - {1}]", value.bot, value.top)
+                log.info("  └─ Inversion: Price closed below {0} (FVG bottom)", value.bot)
+                log.info("  └─ Status: Waiting for retest from ABOVE (bearish signal)")
+                value.x_val := time_tf
+                _inv_ary.push(_ary.remove(i))
+            if _dir == -1 and (c_top > value.top)
+                log.info("🔄 BEARISH FVG INVERTED → Now BULLISH IFVG")
+                log.info("  └─ Time: {0}", str.format_time(time_tf, "yyyy-MM-dd HH:mm", "America/New_York"))
+                log.info("  └─ Bar: {0} | Close: {1}", bar_index, close_tf)
+                log.info("  └─ IFVG Zone: [{0} - {1}]", value.bot, value.top)
+                log.info("  └─ Inversion: Price closed above {0} (FVG top)", value.top)
+                log.info("  └─ Status: Waiting for retest from BELOW (bullish signal)")
+                value.x_val := time_tf
+                _inv_ary.push(_ary.remove(i))
+            
+
+inv_manage(_ary) => //All inversions will be displayed.
+    fire = false
+    fvg signal_fvg = na
+    if _ary.size() >= buffer
+        _ary.shift()
+    if _ary.size() > 0
+        for i = _ary.size()-1 to 0
+            value = _ary.get(i)
+            bx_top = value.top
+            bx_bot = value.bot
+            _dir = value.dir
+            st = value.state
+
+            if (st == 0 and _dir == 1)
+                value.state := 1
+                value.dir := -1
+            if (_dir == -1 and st == 0)
+                value.state := 1
+                value.dir := 1
+            if st >= 1
+                value.right := time_tf
+            // BEARISH signal: price retests from above and closes below
+            // CRITICAL: Use CURRENT bar's high for Wick mode, PREVIOUS bar's close for Close mode
+            if (_dir == -1 and st == 1 and close_tf < bx_bot and (wt?high_tf:close_tf_1) >= bx_bot and (wt?high_tf:close_tf_1) < bx_top)
+                value.labs.push(lab.new(time_tf,bx_top,-1))
+                fire := true
+                signal_fvg := value
+            // BULLISH signal: price retests from below and closes above  
+            // CRITICAL: Use CURRENT bar's low for Wick mode, PREVIOUS bar's close for Close mode
+            if (_dir == 1 and st == 1 and close_tf > bx_top and (wt?low_tf:close_tf_1) <= bx_top and (wt?low_tf:close_tf_1) > bx_bot)
+                value.labs.push(lab.new(time_tf,bx_bot,1))
+                fire := true
+                signal_fvg := value
+            if st >= 1 and ((_dir == -1 and c_top > bx_top) or (_dir == 1 and c_bot < bx_bot))
+                _ary.remove(i)
+            
+    [fire, signal_fvg]
+
+send_it(_ary) => // Draws Everything on the Chart
+    last_index = _ary.size()-1
+    for [index,value] in _ary
+        bx_top = value.top
+        bx_bot = value.bot
+        bx_left = value.left
+        xval = value.x_val
+        mid = value.mid
+        col = value.dir == -1 ? green : red
+        o_col = value.dir == -1 ? red : green
+
+        if index > last_index - disp_num
+            box.new(bx_left,bx_top,xval,bx_bot,bgcolor = col, border_color = invis, xloc = xloc.bar_time)
+            box.new(xval,bx_top,time_tf,bx_bot, bgcolor = o_col, border_color = invis, xloc = xloc.bar_time)
+
+            line.new(bx_left,mid,time_tf,mid, color = gray, style = line.style_dashed, xloc = xloc.bar_time)
+            box.new(bar_index,bx_top,bar_index+50,bx_bot, bgcolor = o_col, border_color = invis)
+            line.new(bar_index,mid,bar_index+50,mid, color = gray, style = line.style_dashed)
+
+            // Only show signal arrows if user wants to see all signals
+            if show_all_signals
+                for stuff in value.labs
+                    label_maker(stuff.x,stuff.y,stuff.dir)
+
+//---------------------------------------------------------------------------------------------------------------------}
+//Time Filter Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Get current hour in the specified timezone
+get_hour_in_timezone(tz_str) =>
+    hour(time, tz_str) + minute(time, tz_str) / 60.0
+
+// Check if current time is in the specified window
+is_in_time_window() =>
+    if time_filter_type == "Disabled"
+        true
+    else if time_filter_type == "ICT Killzones"
+        // ICT Killzones are defined in their respective timezones
+        // We'll use New York time (America/New_York) as the reference
+        switch ict_killzone
+            "London Killzone" => 
+                // 2:00 AM - 5:00 AM EST (London Open = 7:00-10:00 GMT, which is 2:00-5:00 EST/7:00-10:00 EDT)
+                hr_ny = get_hour_in_timezone("America/New_York")
+                hr_ny >= 2.0 and hr_ny < 5.0
+            "New York Killzone" => 
+                // 7:00 AM - 10:00 AM EST (New York Open)
+                hr_ny = get_hour_in_timezone("America/New_York")
+                hr_ny >= 7.0 and hr_ny < 10.0
+            "Asian Killzone" => 
+                // 8:00 PM - 11:00 PM EST (Asian Session = 9:00 PM-12:00 AM Tokyo, which is 7:00-10:00 EST)
+                hr_ny = get_hour_in_timezone("America/New_York")
+                hr_ny >= 20.0 and hr_ny < 23.0
+            "London Close" => 
+                // 11:00 AM - 12:00 PM EST (London Close = 4:00-5:00 PM GMT)
+                hr_ny = get_hour_in_timezone("America/New_York")
+                hr_ny >= 11.0 and hr_ny < 12.0
+            => false
+    else // Custom
+        // For custom time, use user's selected timezone
+        current_hour = timezone_input == "UTC" ? get_hour_in_timezone("UTC") : get_hour_in_timezone(syminfo.timezone)
+        start_time = custom_start_hour + custom_start_min / 60.0
+        end_time = custom_end_hour + custom_end_min / 60.0
+        if end_time > start_time
+            current_hour >= start_time and current_hour < end_time
+        else // Crosses midnight
+            current_hour >= start_time or current_hour < end_time
+
+//---------------------------------------------------------------------------------------------------------------------}
+//Delete drawings
+//---------------------------------------------------------------------------------------------------------------------{
+if barstate.islast
+    for boxes in box.all
+        box.delete(boxes)
+
+    for lines in line.all
+        line.delete(lines)
+
+    for labels in label.all
+        label.delete(labels)
+
+//---------------------------------------------------------------------------------------------------------------------}
+//Data Arrays
+//---------------------------------------------------------------------------------------------------------------------{
+var bull_fvg_ary = array.new<fvg>() // FVG Data, Not all will be Drawn
+var bear_fvg_ary = array.new<fvg>()
+
+var bull_inv_ary = array.new<fvg>() // Inversion Data, All will be Drawn
+var bear_inv_ary = array.new<fvg>()
+
+//---------------------------------------------------------------------------------------------------------------------}
+//FVG Detection
+//---------------------------------------------------------------------------------------------------------------------{
+atr = use_custom_tf ? request.security(syminfo.tickerid, tf, ta.atr(200), lookahead = barmerge.lookahead_off) * atr_multi : nz(ta.atr(200)*atr_multi, ta.cum(high - low) / (bar_index+1))
+
+fvg_up = (low_tf > high_tf_2) and (close_tf_1 > high_tf_2)
+fvg_down = (high_tf < low_tf_2) and (close_tf_1 < low_tf_2)
+
+if fvg_up and math.abs(low_tf-high_tf_2) > atr
+    fvg_size = low_tf - high_tf_2
+    log.info("📌 BULLISH FVG FORMED")
+    log.info("  └─ Time: {0}", str.format_time(time_tf, "yyyy-MM-dd HH:mm", "America/New_York"))
+    log.info("  └─ Bar: {0}", bar_index)
+    log.info("  └─ FVG Zone: [{0} - {1}]", high_tf_2, low_tf)
+    log.info("  └─ Size: {0} pts (ATR Filter: {1})", fvg_size, atr)
+    log.info("  └─ Status: Waiting for inversion (price must close below {0})", high_tf_2)
+    array.push(bull_fvg_ary,fvg.new(time_tf_1, low_tf, time_tf, high_tf_2, math.avg(low_tf,high_tf_2), 1, 0,array.new<lab>(),na))
+
+if fvg_down and math.abs(low_tf_2-high_tf) > atr
+    fvg_size = low_tf_2 - high_tf
+    log.info("📌 BEARISH FVG FORMED")
+    log.info("  └─ Time: {0}", str.format_time(time_tf, "yyyy-MM-dd HH:mm", "America/New_York"))
+    log.info("  └─ Bar: {0}", bar_index)
+    log.info("  └─ FVG Zone: [{0} - {1}]", high_tf, low_tf_2)
+    log.info("  └─ Size: {0} pts (ATR Filter: {1})", fvg_size, atr)
+    log.info("  └─ Status: Waiting for inversion (price must close above {0})", low_tf_2)
+    array.push(bear_fvg_ary,fvg.new(time_tf_1, low_tf_2, time_tf, high_tf, math.avg(high_tf,low_tf_2),-1 ,0,array.new<lab>(),na))
+
+//---------------------------------------------------------------------------------------------------------------------}
+//Running Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// FVG_Data -> Inversion_Data -> Chart
+fvg_manage(bull_fvg_ary,bull_inv_ary)
+fvg_manage(bear_fvg_ary,bear_inv_ary)
+
+// IMPORTANT: Naming convention from original indicator:
+// - bull_inv_ary = bullish FVGs that inverted → when retested → BEARISH signal (SHORT)
+// - bear_inv_ary = bearish FVGs that inverted → when retested → BULLISH signal (LONG)
+[bear_signal, bear_fvg] = inv_manage(bull_inv_ary)  // Bull IFVG retest → SHORT
+[bull_signal, bull_fvg] = inv_manage(bear_inv_ary)  // Bear IFVG retest → LONG
+
+if barstate.islast
+    send_it(bull_inv_ary)
+    send_it(bear_inv_ary)
+
+//---------------------------------------------------------------------------------------------------------------------}
+//Strategy Entry Logic
+//---------------------------------------------------------------------------------------------------------------------{
+// Check direction filter
+allow_bull = direction_filter == "Both" or direction_filter == "Bullish Only"
+allow_bear = direction_filter == "Both" or direction_filter == "Bearish Only"
+
+// Check time filter
+in_time_window = is_in_time_window()
+
+// Debug: Show time filter status with background color (must be at global scope)
+is_new_day = ta.change(dayofmonth(time)) != 0
+show_time_debug = show_debug_labels and time_filter_type != "Disabled" and (is_new_day or (bar_index < 10 and bar_index % 5 == 0))
+bgcolor(show_time_debug ? (in_time_window ? color.new(color.green, 95) : color.new(color.red, 95)) : na)
+
+// Debug: Show time filter status label on first bar of day
+if show_debug_labels and time_filter_type != "Disabled" and is_new_day
+    current_hour = get_hour_in_timezone("America/New_York")
+    label.new(bar_index, high, "Time Filter: " + (in_time_window ? "✓ ACTIVE" : "✗ INACTIVE") + "\nNY Time: " + str.tostring(current_hour, "#.##"), 
+             color = in_time_window ? color.new(color.green, 80) : color.new(color.red, 80), 
+             textcolor = color.white, style = label.style_label_down, size = size.tiny)
+
+// Log ALL signals with timestamp and retest details
+if bull_signal
+    fvg_b = bull_fvg.bot
+    fvg_t = bull_fvg.top
+    time_str = str.format_time(time, "yyyy-MM-dd HH:mm", "America/New_York")
+    
+    // Draw pane-box style label immediately when indicator fires (always gated by show_all_signals)
+    if show_all_signals
+        label.new(time, close, "▲ GL\nClose: " + str.tostring(close, "#.##"), style = label.style_label_up, color = color.new(color.teal, 0), textcolor = color.white, size = size.small, xloc = xloc.bar_time, tooltip = "GL Signal\nTime: " + time_str + "\nClose: " + str.tostring(close, "#.##") + "\nFVG: [" + str.tostring(fvg_b, "#.##") + " - " + str.tostring(fvg_t, "#.##") + "]")
+    
+    log.info("═══════════════════════════════════")
+    log.info("🟢 INDICATOR SIGNAL: GL (Go Long)")
+    log.info("═══════════════════════════════════")
+    log.info("📍 BULL IFVG RETEST DETECTED")
+    log.info("  └─ Time: {0} (NY)", time_str)
+    log.info("  └─ Bar: {0} | Close: {1}", bar_index, close)
+    log.info("  └─ IFVG Zone: [{0} - {1}]", fvg_b, fvg_t)
+    log.info("  └─ Retest Condition: Price closed above {0} (top of IFVG)", fvg_t)
+    log.info("  └─ Previous Position: {0}", wt ? "Wick touched " + str.tostring(low) : "Close[1] was " + str.tostring(close[1]))
+    log.info("  └─ ▲ Green Arrow & GL Label shown on chart at this bar")
+    log.info("")
+    log.info("🔍 Trade Eligibility Check:")
+    if not allow_bull
+        log.warning("  └─ ❌ BLOCKED: Direction filter = {0}", direction_filter)
+    else
+        log.info("  └─ ✓ Direction filter: {0}", direction_filter)
+    if not in_time_window
+        log.warning("  └─ ❌ BLOCKED: Outside time window (Filter={0}, Killzone={1})", time_filter_type, ict_killzone)
+    else
+        log.info("  └─ ✓ Time filter: Passed")
+    if use_date_filter and not in_date_range
+        log.warning("  └─ ❌ BLOCKED: Outside date range ({0} to {1})", str.format_time(start_date, "yyyy-MM-dd", "America/New_York"), str.format_time(end_date, "yyyy-MM-dd", "America/New_York"))
+    else if use_date_filter
+        log.info("  └─ ✓ Date range: Within range")
+    if strategy.position_size != 0
+        log.warning("  └─ ❌ BLOCKED: Position already open (Size={0})", strategy.position_size)
+    else
+        log.info("  └─ ✓ Position: Flat (ready for entry)")
+
+if bear_signal
+    fvg_b = bear_fvg.bot
+    fvg_t = bear_fvg.top
+    time_str = str.format_time(time, "yyyy-MM-dd HH:mm", "America/New_York")
+    
+    // Draw pane-box style label immediately when indicator fires (always gated by show_all_signals)
+    if show_all_signals
+        label.new(time, close, "▼ GS\nClose: " + str.tostring(close, "#.##"), style = label.style_label_down, color = color.new(color.red, 0), textcolor = color.white, size = size.small, xloc = xloc.bar_time, tooltip = "GS Signal\nTime: " + time_str + "\nClose: " + str.tostring(close, "#.##") + "\nFVG: [" + str.tostring(fvg_b, "#.##") + " - " + str.tostring(fvg_t, "#.##") + "]")
+    
+    log.info("═══════════════════════════════════")
+    log.info("🔴 INDICATOR SIGNAL: GS (Go Short)")
+    log.info("═══════════════════════════════════")
+    log.info("📍 BEAR IFVG RETEST DETECTED")
+    log.info("  └─ Time: {0} (NY)", time_str)
+    log.info("  └─ Bar: {0} | Close: {1}", bar_index, close)
+    log.info("  └─ IFVG Zone: [{0} - {1}]", fvg_b, fvg_t)
+    log.info("  └─ Retest Condition: Price closed below {0} (bottom of IFVG)", fvg_b)
+    log.info("  └─ Previous Position: {0}", wt ? "Wick touched " + str.tostring(high) : "Close[1] was " + str.tostring(close[1]))
+    log.info("  └─ ▼ Red Arrow & GS Label shown on chart at this bar")
+    log.info("")
+    log.info("🔍 Trade Eligibility Check:")
+    if not allow_bear
+        log.warning("  └─ ❌ BLOCKED: Direction filter = {0}", direction_filter)
+    else
+        log.info("  └─ ✓ Direction filter: {0}", direction_filter)
+    if not in_time_window
+        log.warning("  └─ ❌ BLOCKED: Outside time window (Filter={0}, Killzone={1})", time_filter_type, ict_killzone)
+    else
+        log.info("  └─ ✓ Time filter: Passed")
+    if use_date_filter and not in_date_range
+        log.warning("  └─ ❌ BLOCKED: Outside date range ({0} to {1})", str.format_time(start_date, "yyyy-MM-dd", "America/New_York"), str.format_time(end_date, "yyyy-MM-dd", "America/New_York"))
+    else if use_date_filter
+        log.info("  └─ ✓ Date range: Within range")
+    if strategy.position_size != 0
+        log.warning("  └─ ❌ BLOCKED: Position already open (Size={0})", strategy.position_size)
+    else
+        log.info("  └─ ✓ Position: Flat (ready for entry)")
+
+// Process new bull signals - Entry at bar close when signal fires
+if bull_signal and allow_bull and in_time_window and in_date_range and strategy.position_size == 0
+    fvg_bottom = bull_fvg.bot
+    fvg_top = bull_fvg.top
+    
+    // Validate FVG data
+    if not na(fvg_bottom) and not na(fvg_top) and fvg_top > fvg_bottom
+        fvg_size = fvg_top - fvg_bottom
+        
+        log.info("")
+        log.info("╔═══════════════════════════════════════════════════════════╗")
+        log.info("║          🚀 STRATEGY EXECUTING LONG TRADE                 ║")
+        log.info("╚═══════════════════════════════════════════════════════════╝")
+        log.info("✓ ALL FILTERS PASSED - Taking LONG Position")
+        log.info("")
+        log.info("📊 Trade Setup:")
+        log.info("  └─ Reason: Bullish IFVG retest signal (GL label on chart)")
+        log.info("  └─ GL Price Level: {0} (FVG Bottom - retest zone)", fvg_bottom)
+        log.info("  └─ Entry Timing: {0}", entry_timing)
+        log.info("  └─ IFVG Zone: [{0} - {1}] (Size: {2} pts)", fvg_bottom, fvg_top, fvg_size)
+        log.info("  └─ Direction Filter: {0} ✓", direction_filter)
+        log.info("  └─ Time Filter: {0} {1} ✓", time_filter_type, time_filter_type == "ICT Killzones" ? "(" + ict_killzone + ")" : "")
+        log.info("")
+        
+        // Entry price - use close as reference (point-based exits adjust to actual fill)
+        entry_price = close
+        
+        log.info("💰 Entry Details:")
+        if entry_timing == "Next Bar Open"
+            log.info("  └─ Reference Price: {0} (signal bar close)", entry_price)
+            log.info("  └─ Actual Entry: NEXT bar OPEN")
+            log.info("  └─ Note: Point-based exits ensure exact SL/TP distances from fill")
+        else
+            log.info("  └─ Entry Price: {0} (SAME bar CLOSE)", entry_price)
+        log.info("  └─ Contracts: {0}", contracts)
+        
+        // Calculate SL based on type - using signal bar close as reference
+        float sl_price = na
+        if sl_type == "Dynamic (FVG-based)"
+            sl_price := fvg_bottom - sl_points
+            log.info("  └─ Stop Loss: {0} (Dynamic: FVG Bottom {1} - {2} pts)", sl_price, fvg_bottom, sl_points)
+        else
+            sl_price := entry_price - sl_points
+            log.info("  └─ Stop Loss: {0} (Static: {1} - {2} pts = {3} pts from entry)", sl_price, entry_price, sl_points, entry_price - sl_price)
+        
+        // Calculate TP based on type
+        float tp_price = na
+        if tp_type == "Dynamic (RR-based)"
+            sl_distance = entry_price - sl_price
+            tp_price := entry_price + ((sl_distance + fvg_size) * tp_value)
+            log.info("  └─ Take Profit: {0} (Dynamic RR: ({1} + {2}) × {3})", tp_price, sl_distance, fvg_size, tp_value)
+            log.info("  └─ Risk/Reward: 1:{0}", (tp_price - entry_price) / (entry_price - sl_price))
+        else // Static
+            tp_price := entry_price + tp_value
+            log.info("  └─ Take Profit: {0} (Static: {1} + {2} pts = {3} pts from entry)", tp_price, entry_price, tp_value, tp_price - entry_price)
+        
+        // Validate prices before entry
+        if not na(sl_price) and not na(tp_price) and tp_price > entry_price and sl_price < entry_price
+            // Create detailed comment for CSV export
+            trade_comment = "GL:" + str.tostring(fvg_bottom, "#.##") + " | FVG:[" + str.tostring(fvg_bottom, "#.##") + "-" + str.tostring(fvg_top, "#.##") + "]"
+            strategy.entry("Long", strategy.long, qty = contracts, comment = trade_comment)
+            
+            // Store pending exit instructions so we can anchor them to the actual fill price
+            pending_long_sl_is_static := sl_type == "Static (Fixed Points)"
+            pending_long_tp_is_static := tp_type == "Static (Fixed Points)"
+            pending_long_sl_points := pending_long_sl_is_static ? sl_points : na
+            pending_long_tp_points := pending_long_tp_is_static ? tp_value : na
+            pending_long_sl_price := pending_long_sl_is_static ? na : sl_price
+            pending_long_tp_price := pending_long_tp_is_static ? na : tp_price
+            
+            time_str = str.format_time(time, "yyyy-MM-dd HH:mm", "America/New_York")
+            log.info("")
+            log.info("✅✅✅ TRADE EXECUTED ✅✅✅")
+            log.info("Direction: LONG (GL)")
+            log.info("GL Level: {0} (FVG Bottom)", fvg_bottom)
+            log.info("Time: {0} (NY)", time_str)
+            log.info("Entry Price: {0}", entry_price)
+            log.info("Stop Loss: {0}", sl_price)
+            log.info("Take Profit: {0}", tp_price)
+            log.info("Risk/Reward: 1:{0}", str.tostring((tp_price - entry_price) / (entry_price - sl_price), "#.##"))
+            log.info("Contracts: {0}", contracts)
+            log.info("═══════════════════════════════════════════════════════════")
+            
+            // Draw GL label to show this LONG trade was taken (always shown when show_all_signals is enabled)
+            if show_all_signals
+                label.new(time, high, "GL", style = label.style_label_down, color = color.new(color.green, 0), textcolor = color.white, size = size.small, xloc = xloc.bar_time, tooltip = "LONG Trade Taken\nFVG: [" + str.tostring(fvg_bottom, "#.##") + " - " + str.tostring(fvg_top, "#.##") + "]\nEntry: " + str.tostring(entry_price, "#.##") + "\nSL: " + str.tostring(sl_price, "#.##") + "\nTP: " + str.tostring(tp_price, "#.##"))
+            
+            // Draw additional debug arrow (only if show_debug_labels is enabled)
+            if show_debug_labels
+                label.new(time, low, "▲\nLONG", style = label.style_label_up, color = color.new(color.blue, 0), textcolor = color.white, size = size.normal, xloc = xloc.bar_time, tooltip = "LONG Entry\nTime: " + str.tostring(time) + "\nFVG: [" + str.tostring(fvg_bottom, "#.##") + " - " + str.tostring(fvg_top, "#.##") + "]")
+                label.new(bar_index, low, "LONG\nE:" + str.tostring(entry_price, "#.##") + "\nSL:" + str.tostring(sl_price, "#.##") + "\nTP:" + str.tostring(tp_price, "#.##"), 
+                         color = color.green, textcolor = color.white, style = label.style_label_up, size = size.small)
+        else
+            log.error("  └─ ❌ REJECTED: Invalid prices (E={0}, SL={1}, TP={2})", entry_price, sl_price, tp_price)
+
+// Process new bear signals - Entry at bar close when signal fires
+if bear_signal and allow_bear and in_time_window and in_date_range and strategy.position_size == 0
+    fvg_bottom = bear_fvg.bot
+    fvg_top = bear_fvg.top
+    
+    // Validate FVG data
+    if not na(fvg_bottom) and not na(fvg_top) and fvg_top > fvg_bottom
+        fvg_size = fvg_top - fvg_bottom
+        
+        log.info("")
+        log.info("╔═══════════════════════════════════════════════════════════╗")
+        log.info("║          🔻 STRATEGY EXECUTING SHORT TRADE                ║")
+        log.info("╚═══════════════════════════════════════════════════════════╝")
+        log.info("✓ ALL FILTERS PASSED - Taking SHORT Position")
+        log.info("")
+        log.info("📊 Trade Setup:")
+        log.info("  └─ Reason: Bearish IFVG retest signal (GS label on chart)")
+        log.info("  └─ GS Price Level: {0} (FVG Top - retest zone)", fvg_top)
+        log.info("  └─ Entry Timing: {0}", entry_timing)
+        log.info("  └─ IFVG Zone: [{0} - {1}] (Size: {2} pts)", fvg_bottom, fvg_top, fvg_size)
+        log.info("  └─ Direction Filter: {0} ✓", direction_filter)
+        log.info("  └─ Time Filter: {0} {1} ✓", time_filter_type, time_filter_type == "ICT Killzones" ? "(" + ict_killzone + ")" : "")
+        log.info("")
+        
+        // Entry price - use close as reference (point-based exits adjust to actual fill)
+        entry_price = close
+        
+        log.info("💰 Entry Details:")
+        if entry_timing == "Next Bar Open"
+            log.info("  └─ Reference Price: {0} (signal bar close)", entry_price)
+            log.info("  └─ Actual Entry: NEXT bar OPEN")
+            log.info("  └─ Note: Point-based exits ensure exact SL/TP distances from fill")
+        else
+            log.info("  └─ Entry Price: {0} (SAME bar CLOSE)", entry_price)
+        log.info("  └─ Contracts: {0}", contracts)
+        
+        // Calculate SL based on type - using signal bar close as reference
+        float sl_price = na
+        if sl_type == "Dynamic (FVG-based)"
+            sl_price := fvg_top + sl_points
+            log.info("  └─ Stop Loss: {0} (Dynamic: FVG Top {1} + {2} pts)", sl_price, fvg_top, sl_points)
+        else
+            sl_price := entry_price + sl_points
+            log.info("  └─ Stop Loss: {0} (Static: {1} + {2} pts = {3} pts from entry)", sl_price, entry_price, sl_points, sl_price - entry_price)
+        
+        // Calculate TP based on type
+        float tp_price = na
+        if tp_type == "Dynamic (RR-based)"
+            sl_distance = sl_price - entry_price
+            tp_price := entry_price - ((sl_distance + fvg_size) * tp_value)
+            log.info("  └─ Take Profit: {0} (Dynamic RR: ({1} + {2}) × {3})", tp_price, sl_distance, fvg_size, tp_value)
+            log.info("  └─ Risk/Reward: 1:{0}", (entry_price - tp_price) / (sl_price - entry_price))
+        else // Static
+            tp_price := entry_price - tp_value
+            log.info("  └─ Take Profit: {0} (Static: {1} - {2} pts = {3} pts from entry)", tp_price, entry_price, tp_value, entry_price - tp_price)
+        
+        // Validate prices before entry
+        if not na(sl_price) and not na(tp_price) and sl_price > entry_price and tp_price < entry_price
+            // Create detailed comment for CSV export
+            trade_comment = "GS:" + str.tostring(fvg_top, "#.##") + " | FVG:[" + str.tostring(fvg_bottom, "#.##") + "-" + str.tostring(fvg_top, "#.##") + "]"
+            strategy.entry("Short", strategy.short, qty = contracts, comment = trade_comment)
+            
+            // Store pending exit instructions so we can anchor them to the actual fill price
+            pending_short_sl_is_static := sl_type == "Static (Fixed Points)"
+            pending_short_tp_is_static := tp_type == "Static (Fixed Points)"
+            pending_short_sl_points := pending_short_sl_is_static ? sl_points : na
+            pending_short_tp_points := pending_short_tp_is_static ? tp_value : na
+            pending_short_sl_price := pending_short_sl_is_static ? na : sl_price
+            pending_short_tp_price := pending_short_tp_is_static ? na : tp_price
+            
+            time_str = str.format_time(time, "yyyy-MM-dd HH:mm", "America/New_York")
+            log.info("")
+            log.info("✅✅✅ TRADE EXECUTED ✅✅✅")
+            log.info("Direction: SHORT (GS)")
+            log.info("GS Level: {0} (FVG Top)", fvg_top)
+            log.info("Time: {0} (NY)", time_str)
+            log.info("Entry Price: {0}", entry_price)
+            log.info("Stop Loss: {0}", sl_price)
+            log.info("Take Profit: {0}", tp_price)
+            log.info("Risk/Reward: 1:{0}", str.tostring((entry_price - tp_price) / (sl_price - entry_price), "#.##"))
+            log.info("Contracts: {0}", contracts)
+            log.info("═══════════════════════════════════════════════════════════")
+            
+            // Draw GS label to show this SHORT trade was taken (always shown when show_all_signals is enabled)
+            if show_all_signals
+                label.new(time, low, "GS", style = label.style_label_up, color = color.new(color.red, 0), textcolor = color.white, size = size.small, xloc = xloc.bar_time, tooltip = "SHORT Trade Taken\nFVG: [" + str.tostring(fvg_bottom, "#.##") + " - " + str.tostring(fvg_top, "#.##") + "]\nEntry: " + str.tostring(entry_price, "#.##") + "\nSL: " + str.tostring(sl_price, "#.##") + "\nTP: " + str.tostring(tp_price, "#.##"))
+            
+            // Draw additional debug arrow (only if show_debug_labels is enabled)
+            if show_debug_labels
+                label.new(time, high, "▼\nSHORT", style = label.style_label_down, color = color.new(color.red, 0), textcolor = color.white, size = size.normal, xloc = xloc.bar_time, tooltip = "SHORT Entry\nTime: " + str.tostring(time) + "\nFVG: [" + str.tostring(fvg_bottom, "#.##") + " - " + str.tostring(fvg_top, "#.##") + "]")
+                label.new(bar_index, high, "SHORT\nE:" + str.tostring(entry_price, "#.##") + "\nSL:" + str.tostring(sl_price, "#.##") + "\nTP:" + str.tostring(tp_price, "#.##"), 
+                         color = color.red, textcolor = color.white, style = label.style_label_down, size = size.small)
+        else
+            log.error("  └─ ❌ REJECTED: Invalid prices (E={0}, SL={1}, TP={2})", entry_price, sl_price, tp_price)
+
+//---------------------------------------------------------------------------------------------------------------------}
+//Anchor SL/TP placements to actual fills
+//---------------------------------------------------------------------------------------------------------------------{
+// Detect newly opened LONG positions (position flipped from flat/short to long)
+long_just_filled = strategy.position_size > 0 and strategy.position_size[1] <= 0
+if long_just_filled
+    entry_actual = strategy.position_avg_price
+    sl_target = pending_long_sl_is_static ? entry_actual - nz(pending_long_sl_points, sl_points) : nz(pending_long_sl_price, entry_actual - sl_points)
+    tp_target = pending_long_tp_is_static ? entry_actual + nz(pending_long_tp_points, tp_value) : nz(pending_long_tp_price, entry_actual + tp_value)
+    active_long_sl_price := sl_target
+    active_long_tp_price := tp_target
+    
+    log.info("🎯 LONG Fill Confirmed:")
+    log.info("  └─ Entry Price: {0}", entry_actual)
+    log.info("  └─ Stop Loss anchored at: {0} (Δ {1} pts)", sl_target, entry_actual - sl_target)
+    log.info("  └─ Take Profit anchored at: {0} (Δ {1} pts)", tp_target, tp_target - entry_actual)
+    
+    // Clear pending buffers
+    pending_long_sl_points := na
+    pending_long_tp_points := na
+    pending_long_sl_price := na
+    pending_long_tp_price := na
+    pending_long_sl_is_static := false
+    pending_long_tp_is_static := false
+
+// Keep LONG exits submitted while position is open
+if strategy.position_size > 0 and not na(active_long_sl_price) and not na(active_long_tp_price)
+    strategy.exit("LongExit", from_entry = "Long", stop = active_long_sl_price, limit = active_long_tp_price)
+else if strategy.position_size <= 0
+    active_long_sl_price := na
+    active_long_tp_price := na
+
+// Detect newly opened SHORT positions (position flipped from flat/long to short)
+short_just_filled = strategy.position_size < 0 and strategy.position_size[1] >= 0
+if short_just_filled
+    entry_actual = strategy.position_avg_price
+    sl_target = pending_short_sl_is_static ? entry_actual + nz(pending_short_sl_points, sl_points) : nz(pending_short_sl_price, entry_actual + sl_points)
+    tp_target = pending_short_tp_is_static ? entry_actual - nz(pending_short_tp_points, tp_value) : nz(pending_short_tp_price, entry_actual - tp_value)
+    active_short_sl_price := sl_target
+    active_short_tp_price := tp_target
+    
+    log.info("🎯 SHORT Fill Confirmed:")
+    log.info("  └─ Entry Price: {0}", entry_actual)
+    log.info("  └─ Stop Loss anchored at: {0} (Δ {1} pts)", sl_target, sl_target - entry_actual)
+    log.info("  └─ Take Profit anchored at: {0} (Δ {1} pts)", tp_target, entry_actual - tp_target)
+    
+    // Clear pending buffers
+    pending_short_sl_points := na
+    pending_short_tp_points := na
+    pending_short_sl_price := na
+    pending_short_tp_price := na
+    pending_short_sl_is_static := false
+    pending_short_tp_is_static := false
+
+// Keep SHORT exits submitted while position is open
+if strategy.position_size < 0 and not na(active_short_sl_price) and not na(active_short_tp_price)
+    strategy.exit("ShortExit", from_entry = "Short", stop = active_short_sl_price, limit = active_short_tp_price)
+else if strategy.position_size >= 0
+    active_short_sl_price := na
+    active_short_tp_price := na
+
+//---------------------------------------------------------------------------------------------------------------------}
+//Trade Exit Logging
+//---------------------------------------------------------------------------------------------------------------------{
+// Track the number of closed trades to detect when a new trade closes
+var int last_closed_trades = 0
+
+// When a trade closes, log the details
+if strategy.closedtrades > last_closed_trades
+    // Get the most recent closed trade details
+    trade_num = strategy.closedtrades
+    entry_time = strategy.closedtrades.entry_time(trade_num - 1)
+    exit_time = strategy.closedtrades.exit_time(trade_num - 1)
+    entry_price = strategy.closedtrades.entry_price(trade_num - 1)
+    exit_price = strategy.closedtrades.exit_price(trade_num - 1)
+    profit = strategy.closedtrades.profit(trade_num - 1)
+    profit_percent = strategy.closedtrades.profit_percent(trade_num - 1)
+    direction = strategy.closedtrades.entry_id(trade_num - 1)
+    
+    // Determine exit reason based on profit/loss
+    exit_reason = profit > 0 ? "✅ Take Profit Hit" : profit < 0 ? "❌ Stop Loss Hit" : "Break Even"
+    
+    log.info("═══════════════════════════════════")
+    log.info("📊 TRADE #{0} CLOSED - {1}", trade_num, exit_reason)
+    log.info("═══════════════════════════════════")
+    log.info("Direction: {0}", direction)
+    log.info("Entry Time: {0}", str.format_time(entry_time, "yyyy-MM-dd HH:mm", "America/New_York"))
+    log.info("Entry Price: {0}", entry_price)
+    log.info("Exit Time: {0}", str.format_time(exit_time, "yyyy-MM-dd HH:mm", "America/New_York"))
+    log.info("Exit Price: {0}", exit_price)
+    log.info("Profit/Loss: {0} ({1}%)", profit, str.tostring(profit_percent, "#.##"))
+    log.info("═══════════════════════════════════")
+    
+    // Update counter
+    last_closed_trades := strategy.closedtrades
+
+//---------------------------------------------------------------------------------------------------------------------}
+//Trade Summary Table (prints on last bar)
+//---------------------------------------------------------------------------------------------------------------------{
+if barstate.islast and strategy.closedtrades > 0
+    log.info("╔═══════════════════════════════════════════════════════════════════════════════════╗")
+    log.info("║                            COMPLETE TRADE HISTORY                                 ║")
+    log.info("╚═══════════════════════════════════════════════════════════════════════════════════╝")
+    log.info("")
+    log.info("Total Trades: {0} | Winners: {1} | Losers: {2} | Win Rate: {3}%", 
+             strategy.closedtrades, 
+             strategy.wintrades, 
+             strategy.losstrades,
+             str.tostring(strategy.wintrades / strategy.closedtrades * 100, "#.##"))
+    log.info("Net Profit: {0} | Gross Profit: {1} | Gross Loss: {2}", 
+             str.tostring(strategy.netprofit, "#.##"),
+             str.tostring(strategy.grossprofit, "#.##"),
+             str.tostring(strategy.grossloss, "#.##"))
+    log.info("")
+    log.info("─────────────────────────────────────────────────────────────────────────────────────")
+    
+    // Print header
+    log.info("│ # │ Dir   │ Entry Time      │ Entry Price │ Exit Time       │ Exit Price  │ P&L      │ Result │")
+    log.info("─────────────────────────────────────────────────────────────────────────────────────")
+    
+    // Print each trade
+    for i = 0 to strategy.closedtrades - 1
+        trade_num = i + 1
+        direction = strategy.closedtrades.entry_id(i) == "Long" ? "LONG " : "SHORT"
+        entry_time_str = str.format_time(strategy.closedtrades.entry_time(i), "MM-dd HH:mm", "America/New_York")
+        exit_time_str = str.format_time(strategy.closedtrades.exit_time(i), "MM-dd HH:mm", "America/New_York")
+        entry_price = strategy.closedtrades.entry_price(i)
+        exit_price = strategy.closedtrades.exit_price(i)
+        profit = strategy.closedtrades.profit(i)
+        result = profit > 0 ? "WIN ✓" : profit < 0 ? "LOSS ✗" : "BE   ="
+        
+        log.info("│{0,number,#} │ {1} │ {2} │ {3,number,#.##} │ {4} │ {5,number,#.##} │ {6,number,#.##} │ {7} │",
+                 trade_num, direction, entry_time_str, entry_price, exit_time_str, exit_price, profit, result)
+    
+    log.info("─────────────────────────────────────────────────────────────────────────────────────")
+    log.info("")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Plot position to ensure strategy markers are displayed
+// TradingView shows entry/exit triangles automatically, but this ensures the plot layer is active
+plot(strategy.position_size, title="Position Size", display=display.none)
+
