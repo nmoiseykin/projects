@@ -1,0 +1,5 @@
+# Questions for OpenAI Assistant
+# One question per line (lines starting with # are ignored)
+
+Provide a powerful motivational quote for a novice day trader.Based on today's USD economic calendar events, provide a brief analysis of the potential market impact and trading opportunities. Focus on high-impact events. Focus on NQ, ES, GC, CL and DXY.Prove important price levels and evident support resistance levels
+

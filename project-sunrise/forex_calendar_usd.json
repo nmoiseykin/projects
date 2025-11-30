@@ -1,0 +1,58 @@
+{
+  "source": "https://www.forexfactory.com/calendar",
+  "timestamp": "2025-10-29T01:05:20.765583",
+  "currency_filter": "USD",
+  "event_count": 5,
+  "events": [
+    {
+      "date": "WedOct 29",
+      "time": "10:00am",
+      "currency": "USD",
+      "impact": "Medium",
+      "event": "Pending Home Sales m/m",
+      "actual": "",
+      "forecast": "1.6%",
+      "previous": "4.0%"
+    },
+    {
+      "date": "WedOct 29",
+      "time": "",
+      "currency": "USD",
+      "impact": "Low",
+      "event": "Crude Oil Inventories",
+      "actual": "",
+      "forecast": "-0.9M",
+      "previous": "-1.0M"
+    },
+    {
+      "date": "WedOct 29",
+      "time": "2:00pm",
+      "currency": "USD",
+      "impact": "High",
+      "event": "Federal Funds Rate",
+      "actual": "",
+      "forecast": "4.00%",
+      "previous": "4.25%"
+    },
+    {
+      "date": "WedOct 29",
+      "time": "",
+      "currency": "USD",
+      "impact": "High",
+      "event": "FOMC Statement",
+      "actual": "",
+      "forecast": "",
+      "previous": ""
+    },
+    {
+      "date": "WedOct 29",
+      "time": "2:30pm",
+      "currency": "USD",
+      "impact": "High",
+      "event": "FOMC Press Conference",
+      "actual": "",
+      "forecast": "",
+      "previous": ""
+    }
+  ]
+}

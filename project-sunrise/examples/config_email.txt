@@ -1,0 +1,24 @@
+# Email Configuration Template
+# Copy this file and fill in your details
+
+# Recipient email
+TO_EMAIL=your_email@example.com
+
+# SMTP Settings (Gmail example)
+SMTP_SERVER=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=your_email@gmail.com
+SMTP_PASSWORD=your_app_password_here
+
+# For Gmail, you need to create an App Password:
+# 1. Go to Google Account settings
+# 2. Security > 2-Step Verification (enable it)
+# 3. Security > App passwords
+# 4. Generate new app password for "Mail"
+# 5. Use that 16-character password here
+
+# Other popular SMTP servers:
+# - Outlook: smtp.office365.com (port 587)
+# - Yahoo: smtp.mail.yahoo.com (port 587)
+# - Custom: your_smtp_server (check with your provider)
+
